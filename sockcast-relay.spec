@@ -24,10 +24,10 @@ them over gRPC to sockcast-server.
 %autosetup -n %{name}-%{version}
 
 %build
-cargo build --release --frozen --offline
+cargo build --release --locked
 
 %check
-cargo test --release --frozen --offline
+cargo test --release --locked
 
 %install
 install -D -m 0755 target/release/sockcast-relay %{buildroot}%{_bindir}/sockcast-relay

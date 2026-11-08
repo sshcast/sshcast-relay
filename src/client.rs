@@ -13,7 +13,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
 use crate::config::RelayConfig;
 
@@ -82,12 +82,18 @@ impl CoordinatorClient {
         }
 
         let url = &self.cfg.servers[idx];
-        let endpoint = Endpoint::from_shared(url.clone())
+        let mut endpoint = Endpoint::from_shared(url.clone())
             .with_context(|| format!("invalid server endpoint URL {url}"))?
             .connect_timeout(Duration::from_millis(self.cfg.connect_timeout_ms))
             .tcp_keepalive(Some(Duration::from_secs(30)))
             .http2_keep_alive_interval(Duration::from_secs(25))
             .keep_alive_timeout(Duration::from_secs(10));
+
+        if url.trim().starts_with("https://") {
+            endpoint = endpoint
+                .tls_config(ClientTlsConfig::new().with_enabled_roots())
+                .with_context(|| format!("failed to configure TLS roots for {url}"))?;
+        }
 
         let channel = endpoint
             .connect()
