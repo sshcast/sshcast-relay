@@ -1,0 +1,15 @@
+[Unit]
+Description=Sockcast Roaming SSH Agent Relay Daemon
+Documentation=https://github.com/theraphim/sockcast-relay
+Requires=sockcast-relay.socket
+After=sockcast-relay.socket network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/sockcast-relay run
+Restart=no
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+Also=sockcast-relay.socket
