@@ -95,10 +95,25 @@ impl CoordinatorClient {
                 .with_context(|| format!("failed to configure TLS roots for {url}"))?;
         }
 
+        let t_conn = Instant::now();
         let channel = endpoint
             .connect()
             .await
+            .map_err(|e| {
+                tracing::warn!(
+                    "Failed to connect gRPC channel to {} after {}ms: {}",
+                    url,
+                    t_conn.elapsed().as_millis(),
+                    e
+                );
+                e
+            })
             .with_context(|| format!("failed to connect to coordinator {url}"))?;
+        tracing::info!(
+            "Connected gRPC channel to {} in {}ms",
+            url,
+            t_conn.elapsed().as_millis()
+        );
 
         {
             let mut guard = self.channels.write().await;
@@ -125,13 +140,23 @@ impl CoordinatorClient {
             let guard = self.key_cache.read().await;
             if let Some(fetched_at) = guard.fetched_at {
                 if fetched_at.elapsed() < ttl && !guard.keys.is_empty() {
+                    tracing::info!(
+                        "GetIdentities served {} key(s) from memory cache in 0ms",
+                        guard.keys.len()
+                    );
                     return guard.keys.clone();
                 }
             }
         }
 
+        let t_id = Instant::now();
         match self.fetch_identities_remote().await {
             Ok(remote_keys) if !remote_keys.is_empty() => {
+                tracing::info!(
+                    "GetIdentities fetched {} key(s) from coordinator in {}ms",
+                    remote_keys.len(),
+                    t_id.elapsed().as_millis()
+                );
                 {
                     let mut guard = self.key_cache.write().await;
                     guard.keys = remote_keys.clone();
@@ -266,9 +291,23 @@ impl CoordinatorClient {
             let mut rpc_req = tonic::Request::new(sign_req.clone());
             rpc_req.set_timeout(Duration::from_secs(self.cfg.sign_timeout_secs));
 
+            let t_sign = Instant::now();
+            tracing::info!(
+                "Dispatching SignRequest {} to {}",
+                sign_req.request_id,
+                self.cfg.servers[idx]
+            );
             match client.sign(rpc_req).await {
                 Ok(resp) => {
                     let inner = resp.into_inner();
+                    tracing::info!(
+                        "SignRequest {} returned from {} in {}ms (approved={}, handled_by={})",
+                        sign_req.request_id,
+                        self.cfg.servers[idx],
+                        t_sign.elapsed().as_millis(),
+                        inner.approved,
+                        inner.handled_by_node_id
+                    );
                     if inner.approved {
                         self.preferred_idx.store(idx, Ordering::Relaxed);
                         return Ok(inner);

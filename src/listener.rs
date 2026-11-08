@@ -148,7 +148,15 @@ pub async fn serve_with_listener(
                 active_conns.fetch_add(1, Ordering::AcqRel);
                 *last_activity.lock().await = Instant::now();
 
+                let t_proc = Instant::now();
                 let proc_ctx = inspect_process_context(&hostname, peer.uid, peer.pid);
+                tracing::info!(
+                    "Accepted agent connection (pid={}, comm={}, ancestors={}, proc_inspect_ms={})",
+                    proc_ctx.pid,
+                    proc_ctx.comm,
+                    proc_ctx.ancestors.len(),
+                    t_proc.elapsed().as_millis()
+                );
                 let coord_clone = Arc::clone(&coord);
                 let active_clone = Arc::clone(&active_conns);
                 let last_act_clone = Arc::clone(&last_activity);
