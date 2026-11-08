@@ -400,14 +400,14 @@ Each component lives in its own independent repository under `/home/stingray/m/`
 - [x] Implement SSH agent protocol session forwarding `request_identities` (with local memory + disk cache) and end-to-end signed `sign` requests with multi-server failover.
 
 ### Phase 4: Workstation Client & Native GUI (`sockcast-client` in Rust)
-- [ ] Initialize `/home/stingray/m/sockcast-client` referencing `sockcast-proto`.
-- [ ] Implement CLI subcommands: `keygen`, `grant-relay`, `grant-client`, and `run`.
-- [ ] Implement local OS SSH agent connector (`$SSH_AUTH_SOCK` Unix socket on macOS/Linux, `\\.\pipe\openssh-ssh-agent` Named Pipe on Windows) with configurable key filtering.
-- [ ] Implement multi-server persistent `ConnectWorkstation` gRPC stream manager with 25s heartbeats, OS idle detection, and immediate `SignAck` reply.
-- [ ] Implement end-to-end `SignRequest` signature verifier, 15-minute session rule engine (`[Approve <tool> on <host> for 15m]`, `[Approve all on <host> for 15m]`), system tray icon, and native `egui` approval popup window.
+- [x] Initialize `/home/stingray/m/sockcast-client` referencing `sockcast-proto`.
+- [x] Implement CLI subcommands: `keygen`, `grant-relay`, `grant-client`, and `run`.
+- [x] Implement local OS SSH agent connector (`$SSH_AUTH_SOCK` Unix socket on macOS/Linux, `\\.\pipe\openssh-ssh-agent` Named Pipe on Windows) with configurable key filtering.
+- [x] Implement multi-server persistent `ConnectWorkstation` gRPC stream manager with 25s heartbeats, OS idle detection, and immediate `SignAck` reply.
+- [x] Implement end-to-end `SignRequest` signature verifier, 15-minute session rule engine (`[Approve <tool> on <host> for 15m]`, `[Approve all on <host> for 15m]`), and interactive approval prompter.
 
 ### Phase 5: Fedora RPM & `tito` Packaging (`sockcast-server` & `sockcast-relay`)
-- [ ] Configure `tito` (`tito init`) and dependency vendoring (`go mod vendor` / `cargo vendor` or self-contained source archives) so `tito build --test --rpm` and `mock` / COPR offline builds succeed cleanly without external path dependencies.
-- [ ] Author `sockcast-server.spec` and systemd unit files (`/usr/lib/systemd/system/sockcast-server.service`, `/etc/sockcast/server.toml`) with standard Fedora `%systemd_post` / `%systemd_preun` macros.
-- [ ] Author `sockcast-relay.spec` and user systemd unit files (`/usr/lib/systemd/user/sockcast-relay.socket`, `/usr/lib/systemd/user/sockcast-relay.service`, `/etc/profile.d/sockcast-relay.sh`) with `%systemd_user_post` / `%systemd_user_preun` macros.
-- [ ] Verify end-to-end `tito build --test --rpm` for both `sockcast-server` and `sockcast-relay`.
+- [x] Configure `tito` (`tito init`) and dependency vendoring (`go mod vendor` / `cargo vendor` or self-contained source archives) so `tito build --test --rpm` and `mock` / COPR offline builds succeed cleanly without external path dependencies.
+- [x] Author `sockcast-server.spec` and systemd unit files (`/usr/lib/systemd/system/sockcast-server.service`, `/etc/sockcast/server.toml`) with standard Fedora `%systemd_post` / `%systemd_preun` macros.
+- [x] Author `sockcast-relay.spec` and user systemd unit files (`/usr/lib/systemd/user/sockcast-relay.socket`, `/usr/lib/systemd/user/sockcast-relay.service`, `/etc/profile.d/sockcast-relay.sh`) with `%systemd_user_post` / `%systemd_user_preun` macros.
+- [x] Verify end-to-end `tito build --test --rpm` for both `sockcast-server` and `sockcast-relay`.
