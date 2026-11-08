@@ -91,7 +91,7 @@ async fn main() -> Result<()> {
                 println!("  Using global RPM systemd user units in /usr/lib/systemd/user/");
             }
             println!(
-                "\nEnsure your shell profile exports:\n  export SSH_AUTH_SOCK=\"/run/user/$(id -u)/sockcast.sock\""
+                "\nEnsure your shell profile exports:\n  bash/zsh: export SSH_AUTH_SOCK=\"$XDG_RUNTIME_DIR/sockcast.sock\"\n  fish:     set -gx SSH_AUTH_SOCK \"$XDG_RUNTIME_DIR/sockcast.sock\""
             );
             Ok(())
         }

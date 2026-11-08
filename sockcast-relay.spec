@@ -34,6 +34,7 @@ install -D -m 0755 target/release/sockcast-relay %{buildroot}%{_bindir}/sockcast
 install -D -m 0644 systemd/sockcast-relay.socket %{buildroot}%{_userunitdir}/sockcast-relay.socket
 install -D -m 0644 systemd/sockcast-relay.service %{buildroot}%{_userunitdir}/sockcast-relay.service
 install -D -m 0644 systemd/sockcast-relay.sh %{buildroot}%{_sysconfdir}/profile.d/sockcast-relay.sh
+install -D -m 0644 systemd/sockcast-relay.fish %{buildroot}%{_sysconfdir}/fish/conf.d/sockcast-relay.fish
 
 %post
 %systemd_user_post sockcast-relay.socket sockcast-relay.service
@@ -47,6 +48,7 @@ install -D -m 0644 systemd/sockcast-relay.sh %{buildroot}%{_sysconfdir}/profile.
 %{_userunitdir}/sockcast-relay.socket
 %{_userunitdir}/sockcast-relay.service
 %config(noreplace) %{_sysconfdir}/profile.d/sockcast-relay.sh
+%config(noreplace) %{_sysconfdir}/fish/conf.d/sockcast-relay.fish
 
 %changelog
 * Sun Nov 08 2026 Paul Komkoff <i@stingr.net> - 0.1.0-1
