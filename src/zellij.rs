@@ -14,6 +14,7 @@ use sockcast_proto::v1::{
     ZellijTunnelFrame,
 };
 use std::collections::HashMap;
+use std::io::Read as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -281,39 +282,308 @@ pub fn rewrite_http_request_for_zellij_web(
 const WS_NORMAL_CLOSE_FRAME: &[u8; 21] = b"\x88\x13\x03\xe8Connection closed";
 const WS_DISCONNECTED_CLOSE_FRAME: &[u8; 21] = b"\x88\x13\x0f\xa1Connection closed";
 
-const ZELLIJ_HTML_EXIT_HOOK: &str = r#"<script>
-window.addEventListener("DOMContentLoaded", () => {
-  const origShowError = window.showErrorModal;
-  if (typeof origShowError === "function") {
-    window.showErrorModal = async function(title, desc) {
-      if (title === "Disconnected") {
-        let screenText = "";
+const SYMBOLS_NERD_FONT_TTF_GZ: &[u8] =
+    include_bytes!("../assets/fonts/SymbolsNerdFontMono-Regular.ttf.gz");
+const IOSEVKA_TERM_REGULAR_TTF_GZ: &[u8] =
+    include_bytes!("../assets/fonts/IosevkaTerm-Regular.ttf.gz");
+const IOSEVKA_TERM_BOLD_TTF_GZ: &[u8] = include_bytes!("../assets/fonts/IosevkaTerm-Bold.ttf.gz");
+
+const SOCKCAST_FONTS_CSS: &str = r#"@font-face {
+  font-family: "Symbols Nerd Font Mono";
+  src: url("/__sockcast/SymbolsNerdFontMono-Regular.ttf") format("truetype");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: block;
+}
+@font-face {
+  font-family: "Symbols Nerd Font Mono";
+  src: url("/__sockcast/SymbolsNerdFontMono-Regular.ttf") format("truetype");
+  font-weight: 100 900;
+  font-style: italic;
+  font-display: block;
+}
+@font-face {
+  font-family: "Iosevka Term";
+  src: url("/__sockcast/IosevkaTerm-Regular.ttf") format("truetype");
+  font-weight: 400;
+  font-style: normal;
+  font-display: block;
+}
+@font-face {
+  font-family: "Iosevka Term";
+  src: url("/__sockcast/IosevkaTerm-Bold.ttf") format("truetype");
+  font-weight: 700;
+  font-style: normal;
+  font-display: block;
+}
+"#;
+
+const SOCKCAST_ZELLIJ_JS: &str = r#"(function () {
+  const SOCKCAST_DEFAULT_FONT_STACK =
+    '"Iosevka Term", "Symbols Nerd Font Mono", "Cascadia Mono", Consolas, "Liberation Mono", Menlo, monospace';
+
+  function withSockcastNerdFonts(rawFont) {
+    if (
+      typeof rawFont !== "string" ||
+      !rawFont.trim() ||
+      rawFont.trim().toLowerCase() === "monospace"
+    ) {
+      return SOCKCAST_DEFAULT_FONT_STACK;
+    }
+    const parts = rawFont
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const withoutGenericAndBundled = parts.filter((p) => {
+      const norm = p.replace(/['"]/g, "").trim().toLowerCase();
+      return (
+        norm !== "monospace" &&
+        norm !== "symbols nerd font mono" &&
+        norm !== "iosevka term"
+      );
+    });
+    return [
+      ...withoutGenericAndBundled,
+      '"Symbols Nerd Font Mono"',
+      '"Iosevka Term"',
+      "monospace",
+    ].join(", ");
+  }
+
+  function preloadSockcastFonts() {
+    if (!document.fonts || typeof document.fonts.load !== "function") {
+      return Promise.resolve();
+    }
+    const loads = Promise.allSettled([
+      document.fonts.load('400 12px "Iosevka Term"'),
+      document.fonts.load('700 12px "Iosevka Term"'),
+      document.fonts.load('400 12px "Symbols Nerd Font Mono"'),
+      document.fonts.load('700 12px "Symbols Nerd Font Mono"'),
+    ]);
+    const timeout = new Promise((resolve) => setTimeout(resolve, 1500));
+    return Promise.race([loads, timeout]);
+  }
+
+  const fontPreloadPromise = preloadSockcastFonts();
+
+  if (typeof window.fetch === "function") {
+    const origFetch = window.fetch.bind(window);
+    window.fetch = async function (input, init) {
+      const urlStr =
+        typeof input === "string"
+          ? input
+          : input && typeof input.url === "string"
+          ? input.url
+          : "";
+      const isSessionBoot =
+        urlStr.includes("/session") && !urlStr.includes("/session-list");
+      if (isSessionBoot) {
+        const [resp] = await Promise.all([
+          origFetch(input, init),
+          fontPreloadPromise,
+        ]);
         try {
-          if (window.term && window.term.buffer && window.term.buffer.active) {
-            const buf = window.term.buffer.active;
-            for (let r = 0; r < buf.length; r++) {
-              const line = buf.getLine(r);
-              if (line) screenText += line.translateToString(true) + "\n";
-            }
+          const clone = resp.clone();
+          const data = await clone.json();
+          if (data && typeof data === "object") {
+            data.config = data.config || {};
+            data.config.font = withSockcastNerdFonts(data.config.font);
+            return new Response(JSON.stringify(data), {
+              status: resp.status,
+              statusText: resp.statusText,
+              headers: resp.headers,
+            });
           }
         } catch (_) {}
-        if (screenText.includes("Web Clients are not allowed to attach")) {
-          await origShowError(
-            "Web Sharing Disabled in Session",
-            "This session was started in the terminal before web_sharing \"on\" was enabled. Restart the session in your terminal (or enable sharing via Zellij's share plugin) to attach from the web."
-          );
-        } else {
-          await origShowError("Session Ended", "The Zellij session has exited. Press Enter or Escape to return to the session list.");
-        }
-        const port = window.location.port ? ":" + window.location.port : "";
-        window.location.href = window.location.protocol + "//localhost" + port + "/";
-        return;
+        return resp;
       }
-      return origShowError(title, desc);
+      return origFetch(input, init);
     };
   }
-});
-</script></body>"#;
+
+  function refreshTermFontAtlas(term) {
+    if (!term) return;
+    try {
+      if (typeof term.clearTextureAtlas === "function") {
+        term.clearTextureAtlas();
+      }
+      if (typeof term.refresh === "function" && term.rows > 0) {
+        term.refresh(0, term.rows - 1);
+      }
+    } catch (_) {}
+  }
+
+  if (typeof window.Terminal === "function") {
+    const OrigTerminal = window.Terminal;
+    window.Terminal = new Proxy(OrigTerminal, {
+      construct(Target, args, newTarget) {
+        const opts = Object.assign({}, args[0] || {});
+        opts.fontFamily = withSockcastNerdFonts(opts.fontFamily);
+        const term = Reflect.construct(Target, [opts, ...args.slice(1)], newTarget);
+        if (term && term._publicOptions) {
+          term._publicOptions = new Proxy(term._publicOptions, {
+            set(target, prop, value) {
+              if (prop === "fontFamily") {
+                value = withSockcastNerdFonts(value);
+              }
+              target[prop] = value;
+              return true;
+            },
+          });
+        }
+        fontPreloadPromise.then(() => refreshTermFontAtlas(term));
+        if (document.fonts && typeof document.fonts.addEventListener === "function") {
+          document.fonts.addEventListener("loadingdone", () =>
+            refreshTermFontAtlas(term)
+          );
+        }
+        return term;
+      },
+    });
+  }
+
+  function installExitModalHook() {
+    const origShowError = window.showErrorModal;
+    if (typeof origShowError === "function" && !origShowError.__sockcastWrapped) {
+      const wrapped = async function (title, desc) {
+        if (title === "Disconnected") {
+          let screenText = "";
+          try {
+            if (window.term && window.term.buffer && window.term.buffer.active) {
+              const buf = window.term.buffer.active;
+              for (let r = 0; r < buf.length; r++) {
+                const line = buf.getLine(r);
+                if (line) screenText += line.translateToString(true) + "\n";
+              }
+            }
+          } catch (_) {}
+          if (screenText.includes("Web Clients are not allowed to attach")) {
+            await origShowError(
+              "Web Sharing Disabled in Session",
+              'This session was started in the terminal before web_sharing "on" was enabled. Restart the session in your terminal (or enable sharing via Zellij\'s share plugin) to attach from the web.'
+            );
+          } else {
+            await origShowError(
+              "Session Ended",
+              "The Zellij session has exited. Press Enter or Escape to return to the session list."
+            );
+          }
+          const port = window.location.port ? ":" + window.location.port : "";
+          window.location.href =
+            window.location.protocol + "//localhost" + port + "/";
+          return;
+        }
+        return origShowError(title, desc);
+      };
+      wrapped.__sockcastWrapped = true;
+      window.showErrorModal = wrapped;
+    }
+  }
+
+  installExitModalHook();
+  window.addEventListener("DOMContentLoaded", installExitModalHook);
+})();
+"#;
+
+const ZELLIJ_HTML_ASSETS_SNIPPET: &str = r#"<link rel="stylesheet" href="/__sockcast/sockcast-fonts.css" />
+<script src="/__sockcast/sockcast-zellij.js"></script>
+"#;
+
+/// Serves embedded `/__sockcast/*` static assets (Nerd Font symbols, Iosevka Term fonts, CSS, and JS hooks).
+/// Returns `Some(http_response_bytes)` if `req_buf` is a `GET` or `HEAD` request for `/__sockcast/*`.
+pub fn try_build_sockcast_asset_http_response(req_buf: &[u8]) -> Option<Vec<u8>> {
+    let header_end = req_buf.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let header_str = std::str::from_utf8(&req_buf[..header_end]).ok()?;
+    let mut lines = header_str.split("\r\n");
+    let req_line = lines.next()?;
+    let mut parts = req_line.split_whitespace();
+    let method = parts.next()?;
+    let raw_path = parts.next()?;
+    if !method.eq_ignore_ascii_case("GET") && !method.eq_ignore_ascii_case("HEAD") {
+        return None;
+    }
+    let clean_path = raw_path.split('?').next().unwrap_or(raw_path);
+    if !clean_path.starts_with("/__sockcast/") {
+        return None;
+    }
+    let is_head = method.eq_ignore_ascii_case("HEAD");
+    let accepts_gzip = header_str.lines().any(|l| {
+        if let Some((k, v)) = l.split_once(':') {
+            k.trim().eq_ignore_ascii_case("accept-encoding")
+                && v.to_ascii_lowercase().contains("gzip")
+        } else {
+            false
+        }
+    });
+
+    enum AssetBody<'a> {
+        Plain(&'a [u8]),
+        GzipFont(&'a [u8]),
+    }
+
+    let (content_type, cache_control, asset_body) = match clean_path {
+        "/__sockcast/sockcast-fonts.css" => (
+            "text/css; charset=utf-8",
+            "no-cache",
+            AssetBody::Plain(SOCKCAST_FONTS_CSS.as_bytes()),
+        ),
+        "/__sockcast/sockcast-zellij.js" => (
+            "application/javascript; charset=utf-8",
+            "no-cache",
+            AssetBody::Plain(SOCKCAST_ZELLIJ_JS.as_bytes()),
+        ),
+        "/__sockcast/SymbolsNerdFontMono-Regular.ttf" => (
+            "font/ttf",
+            "public, max-age=31536000, immutable",
+            AssetBody::GzipFont(SYMBOLS_NERD_FONT_TTF_GZ),
+        ),
+        "/__sockcast/IosevkaTerm-Regular.ttf" => (
+            "font/ttf",
+            "public, max-age=31536000, immutable",
+            AssetBody::GzipFont(IOSEVKA_TERM_REGULAR_TTF_GZ),
+        ),
+        "/__sockcast/IosevkaTerm-Bold.ttf" => (
+            "font/ttf",
+            "public, max-age=31536000, immutable",
+            AssetBody::GzipFont(IOSEVKA_TERM_BOLD_TTF_GZ),
+        ),
+        _ => {
+            return Some(
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_vec(),
+            );
+        }
+    };
+
+    let (body_bytes, content_encoding): (Vec<u8>, Option<&str>) = match asset_body {
+        AssetBody::Plain(b) => (b.to_vec(), None),
+        AssetBody::GzipFont(gz_bytes) => {
+            if accepts_gzip {
+                (gz_bytes.to_vec(), Some("gzip"))
+            } else {
+                let mut decoder = flate2::read::GzDecoder::new(gz_bytes);
+                let mut raw = Vec::new();
+                decoder.read_to_end(&mut raw).ok()?;
+                (raw, None)
+            }
+        }
+    };
+
+    let encoding_header = match content_encoding {
+        Some(enc) => format!("Content-Encoding: {enc}\r\nVary: Accept-Encoding\r\n"),
+        None => String::new(),
+    };
+
+    let headers = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n{encoding_header}Content-Length: {}\r\nCache-Control: {cache_control}\r\nConnection: close\r\n\r\n",
+        body_bytes.len()
+    );
+    let mut out = headers.into_bytes();
+    if !is_head {
+        out.extend_from_slice(&body_bytes);
+    }
+    Some(out)
+}
 
 /// Rewrites `zellij web`'s unmasked WebSocket `CloseFrame { code: 1000, reason: "Connection closed" }`
 /// (`\x88\x13\x03\xe8Connection closed`) to close code `4001` (`\x88\x13\x0f\xa1Connection closed`).
@@ -361,7 +631,21 @@ pub fn inject_set_cookie_into_http_response(
     let mut rewritten_body: Option<Vec<u8>> = None;
     if let Ok(body_str) = std::str::from_utf8(body_bytes) {
         if body_str.contains("assets/app.js") && body_str.contains("</body>") {
-            let new_body = body_str.replacen("</body>", ZELLIJ_HTML_EXIT_HOOK, 1);
+            let new_body = if body_str.contains("<script type=\"module\" src=\"assets/app.js\"") {
+                body_str.replacen(
+                    "<script type=\"module\" src=\"assets/app.js\"",
+                    &format!(
+                        "{ZELLIJ_HTML_ASSETS_SNIPPET}        <script type=\"module\" src=\"assets/app.js\""
+                    ),
+                    1,
+                )
+            } else {
+                body_str.replacen(
+                    "</body>",
+                    &format!("{ZELLIJ_HTML_ASSETS_SNIPPET}</body>"),
+                    1,
+                )
+            };
             rewritten_body = Some(new_body.into_bytes());
         }
     }
@@ -691,6 +975,13 @@ async fn handle_direct_p2p_tcp_stream(
     };
     c2r_cipher.apply_keystream(&mut first_buf[..first_n]);
 
+    if let Some(mut static_resp) = try_build_sockcast_asset_http_response(&first_buf[..first_n]) {
+        r2c_cipher.apply_keystream(&mut static_resp);
+        p2p_stream.write_all(&static_resp).await?;
+        let _ = p2p_stream.shutdown().await;
+        return Ok(());
+    }
+
     let session_cookie = web_mgr.ensure_running_and_get_cookie().await?;
     let local_addr = SocketAddr::from(([127, 0, 0, 1], web_mgr.web_port()));
     let zellij_stream = TcpStream::connect(local_addr)
@@ -881,6 +1172,51 @@ async fn handle_incoming_zellij_frame(
                 .insert(tunnel_id.clone(), in_tx);
 
             tokio::spawn(async move {
+                let Some(Some(first_req_chunk)) = in_rx.recv().await else {
+                    active_tunnels.lock().await.remove(&tunnel_id);
+                    return;
+                };
+
+                if let Some(static_resp) = try_build_sockcast_asset_http_response(&first_req_chunk)
+                {
+                    for chunk in static_resp.chunks(16384) {
+                        if outbound_tx
+                            .send(RelayStreamMessage {
+                                payload: Some(RelayOutPayload::ZellijFrame(ZellijTunnelFrame {
+                                    tunnel_id: tunnel_id.clone(),
+                                    relay_node_id: relay_node_id.clone(),
+                                    client_node_id: client_node_id.clone(),
+                                    frame_type: ZellijFrameType::Data as i32,
+                                    payload: chunk.to_vec(),
+                                    error_message: String::new(),
+                                    sender_grant: None,
+                                    sender_signature: Vec::new(),
+                                })),
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    active_tunnels.lock().await.remove(&tunnel_id);
+                    let _ = outbound_tx
+                        .send(RelayStreamMessage {
+                            payload: Some(RelayOutPayload::ZellijFrame(ZellijTunnelFrame {
+                                tunnel_id,
+                                relay_node_id,
+                                client_node_id,
+                                frame_type: ZellijFrameType::Close as i32,
+                                payload: Vec::new(),
+                                error_message: String::new(),
+                                sender_grant: None,
+                                sender_signature: Vec::new(),
+                            })),
+                        })
+                        .await;
+                    return;
+                }
+
                 let session_cookie = match web_mgr.ensure_running_and_get_cookie().await {
                     Ok(c) => c,
                     Err(e) => {
@@ -932,23 +1268,19 @@ async fn handle_incoming_zellij_frame(
                 let web_port = web_mgr.web_port();
                 let cookie_for_req = session_cookie.clone();
                 tokio::spawn(async move {
-                    let mut first = true;
-                    while let Some(item) = in_rx.recv().await {
-                        let Some(chunk) = item else {
-                            break;
-                        };
-                        let to_write = if first {
-                            first = false;
-                            rewrite_http_request_for_zellij_web(
-                                &chunk,
-                                web_port,
-                                cookie_for_req.as_deref(),
-                            )
-                        } else {
-                            chunk
-                        };
-                        if z_wr.write_all(&to_write).await.is_err() {
-                            break;
+                    let first_rewritten = rewrite_http_request_for_zellij_web(
+                        &first_req_chunk,
+                        web_port,
+                        cookie_for_req.as_deref(),
+                    );
+                    if z_wr.write_all(&first_rewritten).await.is_ok() {
+                        while let Some(item) = in_rx.recv().await {
+                            let Some(chunk) = item else {
+                                break;
+                            };
+                            if z_wr.write_all(&chunk).await.is_err() {
+                                break;
+                            }
                         }
                     }
                     let _ = z_wr.shutdown().await;

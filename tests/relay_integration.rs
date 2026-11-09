@@ -22,6 +22,7 @@ use sockcast_relay::zellij::{
     ensure_zellij_web_sharing_in_file, inject_set_cookie_into_http_response,
     parse_zellij_create_token_output, parse_zellij_list_sessions_output,
     rewrite_http_request_for_zellij_web, rewrite_websocket_normal_close_to_4001,
+    try_build_sockcast_asset_http_response,
 };
 use std::os::unix::fs::PermissionsExt;
 use std::pin::Pin;
@@ -454,6 +455,40 @@ build-rpm [Created 1d ago] (EXITED - attach to resurrect)
     let resp_str = String::from_utf8(resp_injected).unwrap();
     assert!(resp_str.contains("Set-Cookie: session_token=abc123; Path=/; SameSite=Lax\r\n"));
     assert!(resp_str.ends_with("\r\n\r\n<html></html>"));
+
+    let index_resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 88\r\n\r\n<html><body><script type=\"module\" src=\"assets/app.js\"></script></body></html>";
+    let index_injected = inject_set_cookie_into_http_response(index_resp, None);
+    let index_str = String::from_utf8(index_injected).unwrap();
+    assert!(index_str.contains("/__sockcast/sockcast-fonts.css"));
+    assert!(index_str.contains("/__sockcast/sockcast-zellij.js"));
+
+    let css_req = b"GET /__sockcast/sockcast-fonts.css HTTP/1.1\r\nHost: 127.0.0.1:8082\r\n\r\n";
+    let css_resp = String::from_utf8(try_build_sockcast_asset_http_response(css_req).unwrap()).unwrap();
+    assert!(css_resp.starts_with("HTTP/1.1 200 OK\r\nContent-Type: text/css"));
+    assert!(css_resp.contains("Symbols Nerd Font Mono"));
+    assert!(css_resp.contains("Iosevka Term"));
+
+    let js_req = b"GET /__sockcast/sockcast-zellij.js HTTP/1.1\r\nHost: 127.0.0.1:8082\r\n\r\n";
+    let js_resp = String::from_utf8(try_build_sockcast_asset_http_response(js_req).unwrap()).unwrap();
+    assert!(js_resp.starts_with("HTTP/1.1 200 OK\r\nContent-Type: application/javascript"));
+    assert!(js_resp.contains("withSockcastNerdFonts"));
+
+    let font_gz_req = b"GET /__sockcast/SymbolsNerdFontMono-Regular.ttf HTTP/1.1\r\nHost: 127.0.0.1:8082\r\nAccept-Encoding: gzip, deflate\r\n\r\n";
+    let font_gz_resp = try_build_sockcast_asset_http_response(font_gz_req).unwrap();
+    let gz_hdr_end = font_gz_resp.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    let gz_hdr_str = std::str::from_utf8(&font_gz_resp[..gz_hdr_end]).unwrap();
+    assert!(gz_hdr_str.contains("Content-Type: font/ttf\r\n"));
+    assert!(gz_hdr_str.contains("Content-Encoding: gzip\r\n"));
+    assert_eq!(&font_gz_resp[gz_hdr_end + 4..gz_hdr_end + 6], &[0x1f, 0x8b]);
+
+    let font_raw_req = b"GET /__sockcast/IosevkaTerm-Regular.ttf HTTP/1.1\r\nHost: 127.0.0.1:8082\r\n\r\n";
+    let font_raw_resp = try_build_sockcast_asset_http_response(font_raw_req).unwrap();
+    let raw_hdr_end = font_raw_resp.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    let raw_hdr_str = std::str::from_utf8(&font_raw_resp[..raw_hdr_end]).unwrap();
+    assert!(raw_hdr_str.contains("Content-Type: font/ttf\r\n"));
+    assert!(!raw_hdr_str.contains("Content-Encoding: gzip"));
+    // TrueType sfnt version 0x00010000
+    assert_eq!(&font_raw_resp[raw_hdr_end + 4..raw_hdr_end + 8], &[0x00, 0x01, 0x00, 0x00]);
 
     let mut ws_close = b"\x88\x13\x03\xe8Connection closed".to_vec();
     rewrite_websocket_normal_close_to_4001(&mut ws_close);
