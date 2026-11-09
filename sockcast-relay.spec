@@ -1,4 +1,5 @@
 %global debug_package %{nil}
+%global rustflags_codegen_units 16
 
 Name:           sockcast-relay
 Version:        0.1.0
@@ -24,10 +25,12 @@ them over gRPC to sockcast-server.
 %autosetup -n %{name}-%{version}
 
 %build
-cargo build --release --locked
+export CARGO_BUILD_JOBS="${RPM_BUILD_NCPUS:-$(nproc)}"
+cargo build %{?_smp_mflags} --release --locked --bins
 
 %check
-cargo test --release --locked
+export CARGO_BUILD_JOBS="${RPM_BUILD_NCPUS:-$(nproc)}"
+cargo test %{?_smp_mflags} --release --locked
 
 %install
 install -D -m 0755 target/release/sockcast-relay %{buildroot}%{_bindir}/sockcast-relay
