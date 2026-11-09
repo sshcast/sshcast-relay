@@ -19,9 +19,9 @@ use sockcast_relay::proc_inspector::{
     format_cmdline, inspect_process_context_in_proc, parse_proc_stat,
 };
 use sockcast_relay::zellij::{
-    inject_set_cookie_into_http_response, parse_zellij_create_token_output,
-    parse_zellij_list_sessions_output, rewrite_http_request_for_zellij_web,
-    rewrite_websocket_normal_close_to_4001,
+    ensure_zellij_web_sharing_in_file, inject_set_cookie_into_http_response,
+    parse_zellij_create_token_output, parse_zellij_list_sessions_output,
+    rewrite_http_request_for_zellij_web, rewrite_websocket_normal_close_to_4001,
 };
 use std::os::unix::fs::PermissionsExt;
 use std::pin::Pin;
@@ -149,6 +149,16 @@ fn test_init_bundle_writes_config_and_conditional_systemd_units() {
     assert!(out1.installed_local_units);
     assert!(user_systemd_1.join("sockcast-relay.socket").exists());
     assert!(user_systemd_1.join("sockcast-relay.service").exists());
+    assert!(user_systemd_1.join("sockcast-zellij-web.service").exists());
+
+    let relay_svc_unit =
+        std::fs::read_to_string(user_systemd_1.join("sockcast-relay.service")).unwrap();
+    assert!(!relay_svc_unit.contains("PrivateTmp=yes"));
+    assert!(relay_svc_unit.contains("KillMode=process"));
+
+    let zellij_svc_unit =
+        std::fs::read_to_string(user_systemd_1.join("sockcast-zellij-web.service")).unwrap();
+    assert!(zellij_svc_unit.contains("KillMode=process"));
 
     let mode = std::fs::metadata(&cfg_path_1).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
@@ -448,4 +458,20 @@ build-rpm [Created 1d ago] (EXITED - attach to resurrect)
     let mut ws_close = b"\x88\x13\x03\xe8Connection closed".to_vec();
     rewrite_websocket_normal_close_to_4001(&mut ws_close);
     assert_eq!(&ws_close, b"\x88\x13\x0f\xa1Connection closed");
+
+    let tmp = TempDir::new().unwrap();
+    let kdl_path = tmp.path().join("zellij").join("config.kdl");
+    assert!(ensure_zellij_web_sharing_in_file(&kdl_path).unwrap());
+    assert_eq!(
+        std::fs::read_to_string(&kdl_path).unwrap(),
+        "web_sharing \"on\"\n"
+    );
+    assert!(!ensure_zellij_web_sharing_in_file(&kdl_path).unwrap());
+
+    std::fs::write(&kdl_path, "theme \"dracula\"\nweb_sharing \"off\"\n").unwrap();
+    assert!(ensure_zellij_web_sharing_in_file(&kdl_path).unwrap());
+    assert_eq!(
+        std::fs::read_to_string(&kdl_path).unwrap(),
+        "theme \"dracula\"\nweb_sharing \"on\"\n"
+    );
 }

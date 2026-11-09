@@ -1,0 +1,14 @@
+[Unit]
+Description=Sockcast Zellij Web Local Server
+Documentation=https://github.com/theraphim/sockcast-relay
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/zellij web --ip 127.0.0.1 --port 8082
+Restart=on-failure
+RestartSec=2
+KillMode=process
+
+[Install]
+WantedBy=default.target

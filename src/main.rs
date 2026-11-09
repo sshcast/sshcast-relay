@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use sockcast_relay::config::RelayConfig;
 use sockcast_relay::init::{run_init, InitOptions};
 use sockcast_relay::listener::run_daemon;
-use sockcast_relay::zellij::discover_zellij_sessions;
+use sockcast_relay::zellij::{discover_zellij_sessions, ensure_zellij_web_sharing_enabled};
 use std::path::PathBuf;
 use std::process::Command;
 use tracing_subscriber::EnvFilter;
@@ -155,6 +155,20 @@ async fn main() -> Result<()> {
             ZellijAction::Enable { config, port } => {
                 let path = RelayConfig::set_zellij_config(config.as_deref(), true, port)?;
                 println!("Enabled Zellij Web tunneling in {}", path.display());
+                if let Ok(Some(z_cfg)) = ensure_zellij_web_sharing_enabled() {
+                    println!(
+                        "Enabled `web_sharing \"on\"` in {} for terminal Zellij sessions",
+                        z_cfg.display()
+                    );
+                }
+                let _ = Command::new("systemctl")
+                    .args(["--user", "daemon-reload"])
+                    .status();
+                if port.unwrap_or(8082) == 8082 {
+                    let _ = Command::new("systemctl")
+                        .args(["--user", "enable", "--now", "sockcast-zellij-web.service"])
+                        .status();
+                }
                 let _ = Command::new("systemctl")
                     .args(["--user", "restart", "sockcast-relay.service"])
                     .status();
@@ -163,6 +177,9 @@ async fn main() -> Result<()> {
             ZellijAction::Disable { config } => {
                 let path = RelayConfig::set_zellij_config(config.as_deref(), false, None)?;
                 println!("Disabled Zellij Web tunneling in {}", path.display());
+                let _ = Command::new("systemctl")
+                    .args(["--user", "disable", "--now", "sockcast-zellij-web.service"])
+                    .status();
                 let _ = Command::new("systemctl")
                     .args(["--user", "restart", "sockcast-relay.service"])
                     .status();

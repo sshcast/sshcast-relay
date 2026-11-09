@@ -9,7 +9,7 @@ Type=simple
 ExecStart=/usr/bin/sockcast-relay run
 Restart=no
 NoNewPrivileges=yes
-PrivateTmp=yes
+KillMode=process
 
 [Install]
 Also=sockcast-relay.socket

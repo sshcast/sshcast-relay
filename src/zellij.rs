@@ -15,6 +15,7 @@ use sockcast_proto::v1::{
 };
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -24,7 +25,94 @@ use tokio::sync::{mpsc, watch, Mutex};
 use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{ClientTlsConfig, Endpoint};
 
-use crate::config::RelayConfig;
+use crate::config::{home_dir, RelayConfig};
+
+/// Ensures `web_sharing "on"` is present in the given Zellij `config.kdl` file so sessions
+/// started from interactive terminal shells (`zellij` / `zellij attach -c`) allow web clients to attach.
+/// Returns `Ok(true)` if the file was created or updated, or `Ok(false)` if `web_sharing "on"` was already set.
+pub fn ensure_zellij_web_sharing_in_file(config_path: &Path) -> Result<bool> {
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    if !config_path.exists() {
+        std::fs::write(config_path, "web_sharing \"on\"\n")
+            .with_context(|| format!("failed to write {}", config_path.display()))?;
+        return Ok(true);
+    }
+
+    let raw = std::fs::read_to_string(config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+
+    let mut found_active = false;
+    let mut already_on = false;
+    let mut updated_lines = Vec::new();
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("//") && trimmed.starts_with("web_sharing") {
+            let after = trimmed.trim_start_matches("web_sharing").trim();
+            if after.starts_with('"') {
+                found_active = true;
+                if after.starts_with("\"on\"") {
+                    already_on = true;
+                    updated_lines.push(line.to_string());
+                } else {
+                    updated_lines.push("web_sharing \"on\"".to_string());
+                }
+                continue;
+            }
+        }
+        updated_lines.push(line.to_string());
+    }
+
+    if already_on {
+        return Ok(false);
+    }
+
+    let new_contents = if found_active {
+        let mut s = updated_lines.join("\n");
+        s.push('\n');
+        s
+    } else {
+        let mut s = raw;
+        if !s.is_empty() && !s.ends_with('\n') {
+            s.push('\n');
+        }
+        s.push_str("web_sharing \"on\"\n");
+        s
+    };
+
+    std::fs::write(config_path, new_contents)
+        .with_context(|| format!("failed to update {}", config_path.display()))?;
+    Ok(true)
+}
+
+/// Resolves `~/.config/zellij/config.kdl` (or `$XDG_CONFIG_HOME/zellij/config.kdl`) and ensures
+/// `web_sharing "on"` is configured so CLI-started Zellij sessions allow web clients to attach.
+pub fn ensure_zellij_web_sharing_enabled() -> Result<Option<PathBuf>> {
+    let base_dir = if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        if !xdg.is_empty() {
+            PathBuf::from(xdg)
+        } else {
+            home_dir()?.join(".config")
+        }
+    } else {
+        home_dir()?.join(".config")
+    };
+    let config_path = base_dir.join("zellij").join("config.kdl");
+    let modified = ensure_zellij_web_sharing_in_file(&config_path)?;
+    if modified {
+        tracing::info!(
+            "Configured `web_sharing \"on\"` in {} so terminal Zellij sessions allow web attach",
+            config_path.display()
+        );
+        Ok(Some(config_path))
+    } else {
+        Ok(None)
+    }
+}
 
 fn now_unix_sec() -> u64 {
     SystemTime::now()
@@ -199,7 +287,24 @@ window.addEventListener("DOMContentLoaded", () => {
   if (typeof origShowError === "function") {
     window.showErrorModal = async function(title, desc) {
       if (title === "Disconnected") {
-        await origShowError("Session Ended", "The Zellij session has exited. Press Enter or Escape to return to the session list.");
+        let screenText = "";
+        try {
+          if (window.term && window.term.buffer && window.term.buffer.active) {
+            const buf = window.term.buffer.active;
+            for (let r = 0; r < buf.length; r++) {
+              const line = buf.getLine(r);
+              if (line) screenText += line.translateToString(true) + "\n";
+            }
+          }
+        } catch (_) {}
+        if (screenText.includes("Web Clients are not allowed to attach")) {
+          await origShowError(
+            "Web Sharing Disabled in Session",
+            "This session was started in the terminal before web_sharing \"on\" was enabled. Restart the session in your terminal (or enable sharing via Zellij's share plugin) to attach from the web."
+          );
+        } else {
+          await origShowError("Session Ended", "The Zellij session has exited. Press Enter or Escape to return to the session list.");
+        }
         const port = window.location.port ? ":" + window.location.port : "";
         window.location.href = window.location.protocol + "//localhost" + port + "/";
         return;
@@ -328,9 +433,11 @@ impl ZellijWebManager {
             .unwrap_or(false)
     }
 
-    /// Ensures `127.0.0.1:<web_port>` is listening (spawning `zellij web` if needed)
+    /// Ensures `127.0.0.1:<web_port>` is listening (spawning `zellij web` in an isolated
+    /// `KillMode=process` user service unit if available, or falling back to direct spawn)
     /// and returns a valid `session_token=<val>` cookie if `zellij web` authentication is active.
     pub async fn ensure_running_and_get_cookie(&self) -> Result<Option<String>> {
+        let _ = ensure_zellij_web_sharing_enabled();
         if !self.is_port_listening().await {
             let _guard = self.start_lock.lock().await;
             if !self.is_port_listening().await {
@@ -338,25 +445,75 @@ impl ZellijWebManager {
                     "Starting local zellij web server on 127.0.0.1:{}",
                     self.web_port
                 );
-                let _ = Command::new("zellij")
-                    .args([
-                        "web",
-                        "--ip",
-                        "127.0.0.1",
-                        "--port",
-                        &self.web_port.to_string(),
-                    ])
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn()
-                    .context("failed to spawn `zellij web`")?;
-
-                for _ in 0..60 {
-                    if self.is_port_listening().await {
-                        break;
+                // Prefer starting in a dedicated systemd --user unit with KillMode=process
+                // so web-created Zellij session servers survive sockcast-relay restarts.
+                let mut started_via_systemd = false;
+                if self.web_port == 8082 {
+                    if let Ok(st) = Command::new("systemctl")
+                        .args(["--user", "start", "sockcast-zellij-web.service"])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status()
+                    {
+                        started_via_systemd = st.success();
                     }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                if !started_via_systemd {
+                    let unit_name = format!("sockcast-zellij-web-{}", self.web_port);
+                    if let Ok(st) = Command::new("systemd-run")
+                        .args([
+                            "--user",
+                            &format!("--unit={unit_name}"),
+                            "--property=KillMode=process",
+                            "--property=Restart=on-failure",
+                            "--collect",
+                            "zellij",
+                            "web",
+                            "--ip",
+                            "127.0.0.1",
+                            "--port",
+                            &self.web_port.to_string(),
+                        ])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status()
+                    {
+                        started_via_systemd = st.success();
+                    }
+                }
+
+                if started_via_systemd {
+                    for _ in 0..30 {
+                        if self.is_port_listening().await {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                }
+
+                if !self.is_port_listening().await {
+                    let _ = Command::new("zellij")
+                        .args([
+                            "web",
+                            "--ip",
+                            "127.0.0.1",
+                            "--port",
+                            &self.web_port.to_string(),
+                        ])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .context("failed to spawn `zellij web`")?;
+
+                    for _ in 0..60 {
+                        if self.is_port_listening().await {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
                 }
             }
         }

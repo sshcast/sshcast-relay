@@ -36,10 +36,30 @@ Type=simple
 ExecStart={binary_path} run
 Restart=no
 NoNewPrivileges=yes
-PrivateTmp=yes
+KillMode=process
 
 [Install]
 Also=sockcast-relay.socket
+"#
+    )
+}
+
+pub fn render_systemd_zellij_web_service_unit(port: u16) -> String {
+    format!(
+        r#"[Unit]
+Description=Sockcast Zellij Web Local Server
+Documentation=https://github.com/theraphim/sockcast-relay
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/zellij web --ip 127.0.0.1 --port {port}
+Restart=on-failure
+RestartSec=2
+KillMode=process
+
+[Install]
+WantedBy=default.target
 "#
     )
 }
@@ -138,12 +158,18 @@ pub fn run_init(opts: &InitOptions) -> Result<InitOutcome> {
 
         let sock_path = user_systemd_dir.join("sockcast-relay.socket");
         let svc_path = user_systemd_dir.join("sockcast-relay.service");
+        let zellij_svc_path = user_systemd_dir.join("sockcast-zellij-web.service");
 
         let bin_path = resolve_binary_path();
         std::fs::write(&sock_path, SYSTEMD_SOCKET_UNIT)
             .with_context(|| format!("failed to write {}", sock_path.display()))?;
         std::fs::write(&svc_path, render_systemd_service_unit(&bin_path))
             .with_context(|| format!("failed to write {}", svc_path.display()))?;
+        std::fs::write(
+            &zellij_svc_path,
+            render_systemd_zellij_web_service_unit(cfg_file.zellij_web_port),
+        )
+        .with_context(|| format!("failed to write {}", zellij_svc_path.display()))?;
 
         installed_local_units = true;
         socket_unit_path = Some(sock_path);
@@ -151,6 +177,9 @@ pub fn run_init(opts: &InitOptions) -> Result<InitOutcome> {
     }
 
     if !opts.skip_systemctl {
+        if opts.enable_zellij {
+            let _ = crate::zellij::ensure_zellij_web_sharing_enabled();
+        }
         let _ = Command::new("systemctl")
             .args(["--user", "daemon-reload"])
             .status();
@@ -172,6 +201,9 @@ pub fn run_init(opts: &InitOptions) -> Result<InitOutcome> {
             }
         }
         if opts.enable_zellij {
+            let _ = Command::new("systemctl")
+                .args(["--user", "enable", "--now", "sockcast-zellij-web.service"])
+                .status();
             let _ = Command::new("systemctl")
                 .args(["--user", "start", "sockcast-relay.service"])
                 .status();

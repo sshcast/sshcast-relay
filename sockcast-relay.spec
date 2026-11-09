@@ -33,17 +33,18 @@ cargo test --release --locked
 install -D -m 0755 target/release/sockcast-relay %{buildroot}%{_bindir}/sockcast-relay
 install -D -m 0644 systemd/sockcast-relay.socket %{buildroot}%{_userunitdir}/sockcast-relay.socket
 install -D -m 0644 systemd/sockcast-relay.service %{buildroot}%{_userunitdir}/sockcast-relay.service
+install -D -m 0644 systemd/sockcast-zellij-web.service %{buildroot}%{_userunitdir}/sockcast-zellij-web.service
 install -D -m 0644 systemd/sockcast-relay.sh %{buildroot}%{_sysconfdir}/profile.d/sockcast-relay.sh
 install -D -m 0644 systemd/sockcast-relay.fish %{buildroot}%{_sysconfdir}/fish/conf.d/sockcast-relay.fish
 
 %post
-%systemd_user_post sockcast-relay.socket sockcast-relay.service
+%systemd_user_post sockcast-relay.socket sockcast-relay.service sockcast-zellij-web.service
 if [ $1 -ge 2 ] && [ -x "/usr/lib/systemd/systemd-update-helper" ]; then
     /usr/lib/systemd/systemd-update-helper mark-restart-user-units sockcast-relay.service || :
 fi
 
 %preun
-%systemd_user_preun sockcast-relay.socket sockcast-relay.service
+%systemd_user_preun sockcast-relay.socket sockcast-relay.service sockcast-zellij-web.service
 
 %postun
 %systemd_user_postun_with_restart sockcast-relay.service
@@ -53,6 +54,7 @@ fi
 %{_bindir}/sockcast-relay
 %{_userunitdir}/sockcast-relay.socket
 %{_userunitdir}/sockcast-relay.service
+%{_userunitdir}/sockcast-zellij-web.service
 %config(noreplace) %{_sysconfdir}/profile.d/sockcast-relay.sh
 %config(noreplace) %{_sysconfdir}/fish/conf.d/sockcast-relay.fish
 
