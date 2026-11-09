@@ -24,6 +24,17 @@ fn default_sign_timeout_secs() -> u64 {
     65 // 65 seconds (slightly above server's 60s SignResponse wait)
 }
 
+pub fn default_zellij_web_port() -> u16 {
+    8082
+}
+
+pub fn default_stun_servers() -> Vec<String> {
+    sockcast_proto::p2p::DEFAULT_STUN_SERVERS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayConfigFile {
     /// Coordinator server URLs (e.g. ["https://sockcast.example.com", "http://127.0.0.1:50051"])
@@ -50,6 +61,15 @@ pub struct RelayConfigFile {
     /// Overall Sign RPC timeout in seconds (default: 65s).
     #[serde(default = "default_sign_timeout_secs")]
     pub sign_timeout_secs: u64,
+    /// Enable persistent Zellij Web session advertisement and tunneling (`zellij web` on 127.0.0.1).
+    #[serde(default)]
+    pub zellij_enabled: bool,
+    /// Local loopback port for `zellij web` (default: 8082).
+    #[serde(default = "default_zellij_web_port")]
+    pub zellij_web_port: u16,
+    /// STUN servers used for direct P2P hole-punching when a workstation connects to Zellij Web.
+    #[serde(default = "default_stun_servers")]
+    pub stun_servers: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -63,6 +83,9 @@ pub struct RelayConfig {
     pub pubkey_cache_path: PathBuf,
     pub connect_timeout_ms: u64,
     pub sign_timeout_secs: u64,
+    pub zellij_enabled: bool,
+    pub zellij_web_port: u16,
+    pub stun_servers: Vec<String>,
 }
 
 impl RelayConfigFile {
@@ -82,6 +105,9 @@ impl RelayConfigFile {
             pubkey_cache_path: None,
             connect_timeout_ms: default_connect_timeout_ms(),
             sign_timeout_secs: default_sign_timeout_secs(),
+            zellij_enabled: false,
+            zellij_web_port: default_zellij_web_port(),
+            stun_servers: default_stun_servers(),
         }
     }
 }
@@ -142,7 +168,42 @@ impl RelayConfig {
             pubkey_cache_path,
             connect_timeout_ms: file.connect_timeout_ms,
             sign_timeout_secs: file.sign_timeout_secs,
+            zellij_enabled: file.zellij_enabled,
+            zellij_web_port: if file.zellij_web_port == 0 {
+                default_zellij_web_port()
+            } else {
+                file.zellij_web_port
+            },
+            stun_servers: if file.stun_servers.is_empty() {
+                default_stun_servers()
+            } else {
+                file.stun_servers
+            },
         })
+    }
+
+    pub fn set_zellij_config(
+        path: Option<&Path>,
+        enabled: bool,
+        web_port: Option<u16>,
+    ) -> Result<PathBuf> {
+        let cfg_path = match path {
+            Some(p) => p.to_path_buf(),
+            None => default_config_path()?,
+        };
+        let raw = std::fs::read_to_string(&cfg_path)
+            .with_context(|| format!("failed to read relay config {}", cfg_path.display()))?;
+        let mut file: RelayConfigFile =
+            toml::from_str(&raw).context("failed to parse relay.toml")?;
+        file.zellij_enabled = enabled;
+        if let Some(p) = web_port {
+            file.zellij_web_port = p;
+        }
+        let toml_str =
+            toml::to_string_pretty(&file).context("failed to serialize relay.toml")?;
+        std::fs::write(&cfg_path, &toml_str)
+            .with_context(|| format!("failed to write {}", cfg_path.display()))?;
+        Ok(cfg_path)
     }
 }
 

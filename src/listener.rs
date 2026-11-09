@@ -94,15 +94,27 @@ pub async fn serve_with_listener(
 ) -> Result<()> {
     let expected_uid = current_euid();
     let hostname = cfg.grant.node_id.clone();
+    let effective_idle_timeout = if cfg.zellij_enabled {
+        Duration::ZERO
+    } else {
+        idle_timeout
+    };
+    if cfg.zellij_enabled {
+        let zellij_cfg = cfg.clone();
+        let zellij_shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            crate::zellij::run_zellij_relay_worker(zellij_cfg, zellij_shutdown).await;
+        });
+    }
     let coord = Arc::new(CoordinatorClient::new(cfg));
 
     let active_conns = Arc::new(AtomicUsize::new(0));
     let last_activity = Arc::new(Mutex::new(Instant::now()));
 
-    let check_interval = if idle_timeout.is_zero() {
+    let check_interval = if effective_idle_timeout.is_zero() {
         Duration::from_secs(3600)
     } else {
-        (idle_timeout / 4).clamp(Duration::from_millis(20), Duration::from_secs(5))
+        (effective_idle_timeout / 4).clamp(Duration::from_millis(20), Duration::from_secs(5))
     };
 
     let mut ticker = tokio::time::interval(check_interval);
@@ -116,13 +128,13 @@ pub async fn serve_with_listener(
                     return Ok(());
                 }
             }
-            _ = ticker.tick(), if !idle_timeout.is_zero() => {
+            _ = ticker.tick(), if !effective_idle_timeout.is_zero() => {
                 if active_conns.load(Ordering::Acquire) == 0 {
                     let elapsed = last_activity.lock().await.elapsed();
-                    if elapsed >= idle_timeout {
+                    if elapsed >= effective_idle_timeout {
                         tracing::info!(
                             "Idle timeout ({:?}) reached with 0 active connections; exiting cleanly to 0 MB RSS",
-                            idle_timeout
+                            effective_idle_timeout
                         );
                         return Ok(());
                     }

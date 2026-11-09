@@ -4,7 +4,8 @@ use sockcast_proto::crypto::{sign_node_grant, verify_node_auth, verify_sign_requ
 use sockcast_proto::v1::sockcast_service_server::{SockcastService, SockcastServiceServer};
 use sockcast_proto::v1::{
     ClientStreamMessage, GetIdentitiesRequest, GetIdentitiesResponse, NodeGrant, NodeRole,
-    PublicKey, ServerStreamMessage, SignRequest, SignResponse,
+    PublicKey, RelayStreamMessage, ServerStreamMessage, ServerToRelayMessage, SignRequest,
+    SignResponse,
 };
 use sockcast_relay::agent::{
     read_agent_frame, write_agent_frame, SSH2_AGENTC_ADD_IDENTITY, SSH2_AGENTC_REMOVE_ALL_IDENTITIES,
@@ -16,6 +17,10 @@ use sockcast_relay::init::{run_init, InitOptions};
 use sockcast_relay::listener::{bind_standalone_socket, serve_with_listener};
 use sockcast_relay::proc_inspector::{
     format_cmdline, inspect_process_context_in_proc, parse_proc_stat,
+};
+use sockcast_relay::zellij::{
+    inject_set_cookie_into_http_response, parse_zellij_create_token_output,
+    parse_zellij_list_sessions_output, rewrite_http_request_for_zellij_web,
 };
 use std::os::unix::fs::PermissionsExt;
 use std::pin::Pin;
@@ -136,6 +141,7 @@ fn test_init_bundle_writes_config_and_conditional_systemd_units() {
         systemd_user_dir: Some(user_systemd_1.clone()),
         global_systemd_user_dir: fake_global_empty,
         skip_systemctl: true,
+        enable_zellij: false,
     })
     .unwrap();
 
@@ -149,6 +155,12 @@ fn test_init_bundle_writes_config_and_conditional_systemd_units() {
     let loaded_cfg = RelayConfig::load(Some(&cfg_path_1)).unwrap();
     assert_eq!(loaded_cfg.grant.node_id, "server-x.infra.local");
     assert_eq!(loaded_cfg.node_signing_key.to_bytes(), relay_sk.to_bytes());
+    assert!(!loaded_cfg.zellij_enabled);
+
+    RelayConfig::set_zellij_config(Some(&cfg_path_1), true, Some(18082)).unwrap();
+    let updated_cfg = RelayConfig::load(Some(&cfg_path_1)).unwrap();
+    assert!(updated_cfg.zellij_enabled);
+    assert_eq!(updated_cfg.zellij_web_port, 18082);
 
     // Case 2: Global RPM units DO exist in /usr/lib/systemd/user -> does NOT write ~/.config/systemd/user units
     let fake_global_rpm = tmp.path().join("global-rpm");
@@ -165,6 +177,7 @@ fn test_init_bundle_writes_config_and_conditional_systemd_units() {
         systemd_user_dir: Some(user_systemd_2.clone()),
         global_systemd_user_dir: fake_global_rpm,
         skip_systemctl: true,
+        enable_zellij: true,
     })
     .unwrap();
 
@@ -228,6 +241,16 @@ impl SockcastService for MockCoordinator {
         _request: Request<Streaming<ClientStreamMessage>>,
     ) -> Result<Response<Self::ConnectWorkstationStream>, Status> {
         Err(Status::unimplemented("not used in relay test"))
+    }
+
+    type ConnectRelayStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<ServerToRelayMessage, Status>> + Send>>;
+
+    async fn connect_relay(
+        &self,
+        _request: Request<Streaming<RelayStreamMessage>>,
+    ) -> Result<Response<Self::ConnectRelayStream>, Status> {
+        Err(Status::unimplemented("not used in agent test"))
     }
 }
 
@@ -293,6 +316,9 @@ async fn test_end_to_end_agent_session_failover_and_idle_timeout() {
         pubkey_cache_path: pubkey_cache_path.clone(),
         connect_timeout_ms: 250,
         sign_timeout_secs: 5,
+        zellij_enabled: false,
+        zellij_web_port: 8082,
+        stun_servers: Vec::new(),
     };
 
     let unix_listener: UnixListener = bind_standalone_socket(&sock_path).unwrap();
@@ -383,4 +409,38 @@ async fn test_end_to_end_agent_session_failover_and_idle_timeout() {
         .expect("daemon should auto-exit on idle timeout")
         .unwrap();
     assert!(daemon_res.is_ok());
+}
+
+#[test]
+fn test_zellij_session_parsing_token_and_header_rewriter() {
+    let raw_sessions = "\
+work-main [Created 2h 15m ago]
+build-rpm [Created 1d ago] (EXITED - attach to resurrect)
+";
+    let sessions = parse_zellij_list_sessions_output(raw_sessions);
+    assert_eq!(sessions.len(), 2);
+    assert_eq!(sessions[0].name, "work-main");
+    assert!(!sessions[0].exited);
+    assert_eq!(sessions[1].name, "build-rpm");
+    assert!(sessions[1].exited);
+
+    let token_out = "Created token successfully\n\ntoken_1: 18fcbf46-3526-4d04-8364-e015403284eb\n";
+    assert_eq!(
+        parse_zellij_create_token_output(token_out).as_deref(),
+        Some("18fcbf46-3526-4d04-8364-e015403284eb")
+    );
+
+    let req = b"GET /ws/terminal/work-main HTTP/1.1\r\nHost: sunduk.localhost:18080\r\nOrigin: http://sunduk.localhost:18080\r\nUpgrade: websocket\r\n\r\npayload";
+    let rewritten = rewrite_http_request_for_zellij_web(req, 8082, Some("session_token=abc123"));
+    let rewritten_str = String::from_utf8(rewritten).unwrap();
+    assert!(rewritten_str.contains("Host: 127.0.0.1:8082\r\n"));
+    assert!(rewritten_str.contains("Origin: http://127.0.0.1:8082\r\n"));
+    assert!(rewritten_str.contains("Cookie: session_token=abc123\r\n"));
+    assert!(rewritten_str.ends_with("\r\n\r\npayload"));
+
+    let resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html></html>";
+    let resp_injected = inject_set_cookie_into_http_response(resp, Some("session_token=abc123"));
+    let resp_str = String::from_utf8(resp_injected).unwrap();
+    assert!(resp_str.contains("Set-Cookie: session_token=abc123; Path=/; SameSite=Lax\r\n"));
+    assert!(resp_str.ends_with("\r\n\r\n<html></html>"));
 }

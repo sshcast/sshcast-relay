@@ -51,6 +51,7 @@ pub struct InitOptions {
     pub systemd_user_dir: Option<PathBuf>,
     pub global_systemd_user_dir: PathBuf,
     pub skip_systemctl: bool,
+    pub enable_zellij: bool,
 }
 
 impl Default for InitOptions {
@@ -61,6 +62,7 @@ impl Default for InitOptions {
             systemd_user_dir: None,
             global_systemd_user_dir: PathBuf::from("/usr/lib/systemd/user"),
             skip_systemctl: false,
+            enable_zellij: false,
         }
     }
 }
@@ -106,7 +108,8 @@ pub fn run_init(opts: &InitOptions) -> Result<InitOutcome> {
         let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
     }
 
-    let cfg_file = RelayConfigFile::from_bundle(&bundle);
+    let mut cfg_file = RelayConfigFile::from_bundle(&bundle);
+    cfg_file.zellij_enabled = opts.enable_zellij;
     let toml_str =
         toml::to_string_pretty(&cfg_file).context("failed to serialize relay.toml")?;
     std::fs::write(&cfg_path, &toml_str)
@@ -167,6 +170,11 @@ pub fn run_init(opts: &InitOptions) -> Result<InitOutcome> {
             Err(e) => {
                 tracing::warn!("Could not execute systemctl --user: {}", e);
             }
+        }
+        if opts.enable_zellij {
+            let _ = Command::new("systemctl")
+                .args(["--user", "start", "sockcast-relay.service"])
+                .status();
         }
         check_systemd_linger();
     }

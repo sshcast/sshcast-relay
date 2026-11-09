@@ -3,7 +3,9 @@ use clap::{Parser, Subcommand};
 use sockcast_relay::config::RelayConfig;
 use sockcast_relay::init::{run_init, InitOptions};
 use sockcast_relay::listener::run_daemon;
+use sockcast_relay::zellij::discover_zellij_sessions;
 use std::path::PathBuf;
+use std::process::Command;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -32,6 +34,10 @@ enum Commands {
         /// Skip running `systemctl --user enable --now sockcast-relay.socket`
         #[arg(long, default_value_t = false)]
         no_systemctl: bool,
+
+        /// Enable Zellij Web session advertisement and tunneling (`zellij web` on 127.0.0.1)
+        #[arg(long, default_value_t = false)]
+        enable_zellij: bool,
     },
     /// Run the SSH agent relay daemon (invoked via `systemd --user` socket activation or standalone)
     Run {
@@ -46,6 +52,36 @@ enum Commands {
         /// Optional override for idle auto-exit timeout in seconds (0 = never exit)
         #[arg(long)]
         idle_timeout_secs: Option<u64>,
+    },
+    /// Configure or inspect Zellij Web session advertisement and tunneling on this relay host
+    Zellij {
+        #[command(subcommand)]
+        action: ZellijAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ZellijAction {
+    /// Enable Zellij Web advertisement and tunneling on this relay host
+    Enable {
+        /// Optional custom path for `relay.toml`
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Optional loopback port for `zellij web` (default: 8082)
+        #[arg(long)]
+        port: Option<u16>,
+    },
+    /// Disable Zellij Web advertisement and tunneling on this relay host
+    Disable {
+        /// Optional custom path for `relay.toml`
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Show Zellij Web configuration and discovered local Zellij sessions
+    Status {
+        /// Optional custom path for `relay.toml`
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
 }
 
@@ -69,11 +105,13 @@ async fn main() -> Result<()> {
             bundle,
             config,
             no_systemctl,
+            enable_zellij,
         } => {
             let opts = InitOptions {
                 bundle_token: bundle,
                 config_path: config,
                 skip_systemctl: no_systemctl,
+                enable_zellij,
                 ..Default::default()
             };
             let outcome = run_init(&opts)?;
@@ -83,6 +121,10 @@ async fn main() -> Result<()> {
             );
             println!("  Config written to: {}", outcome.config_path.display());
             println!("  Coordinators:      {}", outcome.servers.join(", "));
+            println!(
+                "  Zellij Web:        {}",
+                if enable_zellij { "enabled" } else { "disabled" }
+            );
             if outcome.installed_local_units {
                 if let Some(sock) = &outcome.socket_unit_path {
                     println!("  User socket unit:  {}", sock.display());
@@ -109,5 +151,45 @@ async fn main() -> Result<()> {
             }
             run_daemon(cfg).await
         }
+        Commands::Zellij { action } => match action {
+            ZellijAction::Enable { config, port } => {
+                let path = RelayConfig::set_zellij_config(config.as_deref(), true, port)?;
+                println!("Enabled Zellij Web tunneling in {}", path.display());
+                let _ = Command::new("systemctl")
+                    .args(["--user", "restart", "sockcast-relay.service"])
+                    .status();
+                Ok(())
+            }
+            ZellijAction::Disable { config } => {
+                let path = RelayConfig::set_zellij_config(config.as_deref(), false, None)?;
+                println!("Disabled Zellij Web tunneling in {}", path.display());
+                let _ = Command::new("systemctl")
+                    .args(["--user", "restart", "sockcast-relay.service"])
+                    .status();
+                Ok(())
+            }
+            ZellijAction::Status { config } => {
+                let cfg = RelayConfig::load(config.as_deref())?;
+                println!("Node ID:         {}", cfg.grant.node_id);
+                println!("Zellij Enabled:  {}", cfg.zellij_enabled);
+                println!("Zellij Web Port: 127.0.0.1:{}", cfg.zellij_web_port);
+                println!("STUN Servers:    {}", cfg.stun_servers.join(", "));
+                let sessions = discover_zellij_sessions();
+                if sessions.is_empty() {
+                    println!("Active Sessions: (none)");
+                } else {
+                    println!("Active Sessions ({}):", sessions.len());
+                    for s in sessions {
+                        println!(
+                            "  - {} {} {}",
+                            s.name,
+                            s.created_info,
+                            if s.exited { "[EXITED]" } else { "" }
+                        );
+                    }
+                }
+                Ok(())
+            }
+        },
     }
 }
