@@ -549,7 +549,7 @@ async fn handle_direct_p2p_tcp_stream(
     );
     z_wr.write_all(&rewritten_first).await?;
 
-    let c2r_task = tokio::spawn(async move {
+    let mut c2r_task = tokio::spawn(async move {
         let mut buf = vec![0u8; 16384];
         loop {
             let n = match p2p_rd.read(&mut buf).await {
@@ -566,7 +566,7 @@ async fn handle_direct_p2p_tcp_stream(
     });
 
     let cookie_for_resp = session_cookie;
-    let mut r2c_task = tokio::spawn(async move {
+    let r2c_task = tokio::spawn(async move {
         let mut first_chunk = true;
         let mut is_ws = false;
         let mut buf = vec![0u8; 16384];
@@ -595,8 +595,9 @@ async fn handle_direct_p2p_tcp_stream(
         let _ = p2p_wr.shutdown().await;
     });
 
-    let _ = &mut r2c_task.await;
-    let _ = tokio::time::timeout(Duration::from_millis(150), c2r_task).await;
+    let _ = r2c_task.await;
+    let _ = tokio::time::timeout(Duration::from_millis(150), &mut c2r_task).await;
+    c2r_task.abort();
     Ok(())
 }
 
@@ -673,12 +674,9 @@ async fn handle_incoming_zellij_frame(
                     })
                     .await;
 
-                let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
                 loop {
-                    tokio::select! {
-                        _ = tokio::time::sleep_until(deadline) => break,
-                        res = listener.accept() => {
-                            let Ok((stream, peer_addr)) = res else { break; };
+                    match tokio::time::timeout(Duration::from_secs(3600), listener.accept()).await {
+                        Ok(Ok((stream, peer_addr))) => {
                             tracing::debug!("Accepted direct P2P Zellij stream from {}", peer_addr);
                             let mgr = Arc::clone(&web_mgr);
                             tokio::spawn(async move {
@@ -692,6 +690,7 @@ async fn handle_incoming_zellij_frame(
                                 .await;
                             });
                         }
+                        _ => break,
                     }
                 }
             });
@@ -877,6 +876,18 @@ async fn handle_incoming_zellij_frame(
     }
 }
 
+async fn discover_zellij_sessions_async() -> Vec<ZellijSessionInfo> {
+    match tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::task::spawn_blocking(discover_zellij_sessions),
+    )
+    .await
+    {
+        Ok(Ok(sessions)) => sessions,
+        _ => Vec::new(),
+    }
+}
+
 async fn run_single_coordinator_relay_stream(
     server_url: &str,
     cfg: Arc<RelayConfig>,
@@ -912,7 +923,7 @@ async fn run_single_coordinator_relay_stream(
         })
         .await?;
 
-    let initial_sessions = discover_zellij_sessions();
+    let initial_sessions = discover_zellij_sessions_async().await;
     out_tx
         .send(RelayStreamMessage {
             payload: Some(RelayOutPayload::ZellijStatus(RelayZellijStatus {
@@ -949,7 +960,7 @@ async fn run_single_coordinator_relay_stream(
                 }
             }
             _ = status_ticker.tick() => {
-                let current = discover_zellij_sessions();
+                let current = discover_zellij_sessions_async().await;
                 if current != last_sessions {
                     last_sessions = current.clone();
                     let _ = out_tx.send(RelayStreamMessage {
@@ -969,7 +980,7 @@ async fn run_single_coordinator_relay_stream(
                 match msg.payload {
                     Some(ServerInPayload::ServerHeartbeatEpochMs(_)) => {}
                     Some(ServerInPayload::RefreshSessions(true)) => {
-                        let current = discover_zellij_sessions();
+                        let current = discover_zellij_sessions_async().await;
                         last_sessions = current.clone();
                         let _ = out_tx.send(RelayStreamMessage {
                             payload: Some(RelayOutPayload::ZellijStatus(RelayZellijStatus {
