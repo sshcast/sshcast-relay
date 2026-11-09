@@ -38,9 +38,15 @@ install -D -m 0644 systemd/sockcast-relay.fish %{buildroot}%{_sysconfdir}/fish/c
 
 %post
 %systemd_user_post sockcast-relay.socket sockcast-relay.service
+if [ $1 -ge 2 ] && [ -x "/usr/lib/systemd/systemd-update-helper" ]; then
+    /usr/lib/systemd/systemd-update-helper mark-restart-user-units sockcast-relay.service || :
+fi
 
 %preun
 %systemd_user_preun sockcast-relay.socket sockcast-relay.service
+
+%postun
+%systemd_user_postun_with_restart sockcast-relay.service
 
 %files
 %doc doc/roaming_ssh_agent_architecture_spec.md
