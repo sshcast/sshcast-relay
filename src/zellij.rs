@@ -14,7 +14,7 @@ use sockcast_proto::v1::{
     ZellijTunnelFrame,
 };
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -25,9 +25,6 @@ use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{ClientTlsConfig, Endpoint};
 
 use crate::config::RelayConfig;
-
-pub const P2P_CLIENT_MAGIC: &[u8; 16] = b"SC_P2P_STREAM_V1";
-pub const P2P_RELAY_MAGIC: &[u8; 16] = b"SC_P2P_READY_V1!";
 
 fn now_unix_sec() -> u64 {
     SystemTime::now()
@@ -101,6 +98,8 @@ pub fn parse_zellij_create_token_output(raw: &str) -> Option<String> {
 /// - Sets `Host: 127.0.0.1:<web_port>`
 /// - Rewrites `Origin:` (if present) to `http://127.0.0.1:<web_port>`
 /// - Injects `session_token=<val>` into `Cookie:` so `zellij web` never prompts the user for a token.
+/// - Forces `Connection: close` on non-WebSocket requests so each HTTP asset request uses a clean
+///   1-request-per-tunnel lifecycle while WebSockets keep `Connection: Upgrade`.
 pub fn rewrite_http_request_for_zellij_web(
     buf: &[u8],
     web_port: u16,
@@ -113,12 +112,21 @@ pub fn rewrite_http_request_for_zellij_web(
         Ok(s) => s,
         Err(_) => return buf.to_vec(),
     };
+    let is_websocket = header_str.lines().any(|l| {
+        if let Some((k, v)) = l.split_once(':') {
+            k.trim().eq_ignore_ascii_case("upgrade")
+                && v.to_ascii_lowercase().contains("websocket")
+        } else {
+            false
+        }
+    });
+
     let mut lines = header_str.split("\r\n");
     let Some(request_line) = lines.next() else {
         return buf.to_vec();
     };
 
-    let mut out_headers = String::with_capacity(header_str.len() + 128);
+    let mut out_headers = String::with_capacity(header_str.len() + 160);
     out_headers.push_str(request_line);
     out_headers.push_str("\r\n");
 
@@ -126,6 +134,7 @@ pub fn rewrite_http_request_for_zellij_web(
     let target_origin = format!("http://127.0.0.1:{web_port}");
     let mut saw_host = false;
     let mut saw_cookie = false;
+    let mut saw_connection = false;
 
     for line in lines {
         if let Some((name, val)) = line.split_once(':') {
@@ -137,6 +146,11 @@ pub fn rewrite_http_request_for_zellij_web(
             }
             if name_trim.eq_ignore_ascii_case("origin") {
                 out_headers.push_str(&format!("Origin: {target_origin}\r\n"));
+                continue;
+            }
+            if !is_websocket && name_trim.eq_ignore_ascii_case("connection") {
+                saw_connection = true;
+                out_headers.push_str("Connection: close\r\n");
                 continue;
             }
             if name_trim.eq_ignore_ascii_case("cookie") {
@@ -161,6 +175,9 @@ pub fn rewrite_http_request_for_zellij_web(
     if !saw_host {
         out_headers.push_str(&format!("Host: {target_host}\r\n"));
     }
+    if !is_websocket && !saw_connection {
+        out_headers.push_str("Connection: close\r\n");
+    }
     if !saw_cookie {
         if let Some(cookie_kv) = session_cookie {
             out_headers.push_str(&format!("Cookie: {cookie_kv}\r\n"));
@@ -173,15 +190,12 @@ pub fn rewrite_http_request_for_zellij_web(
     out
 }
 
-/// Injects `Set-Cookie: session_token=...; Path=/; SameSite=Lax` into an HTTP response header block
-/// if not already present so the browser stores the cookie locally as well.
+/// Injects `Set-Cookie: session_token=...; Path=/; SameSite=Lax` (and `Connection: close` on non-101 responses)
+/// into an HTTP response header block if not already present so the browser stores the cookie locally as well.
 pub fn inject_set_cookie_into_http_response(
     buf: &[u8],
     session_cookie: Option<&str>,
 ) -> Vec<u8> {
-    let Some(cookie_kv) = session_cookie else {
-        return buf.to_vec();
-    };
     if !buf.starts_with(b"HTTP/1.") {
         return buf.to_vec();
     }
@@ -189,19 +203,33 @@ pub fn inject_set_cookie_into_http_response(
         return buf.to_vec();
     };
     let header_bytes = &buf[..header_end];
-    if let Ok(header_str) = std::str::from_utf8(header_bytes) {
-        if header_str.to_ascii_lowercase().contains("set-cookie: session_token=") {
-            return buf.to_vec();
-        }
-        let mut out = Vec::with_capacity(buf.len() + cookie_kv.len() + 48);
-        out.extend_from_slice(header_bytes);
-        out.extend_from_slice(
-            format!("\r\nSet-Cookie: {cookie_kv}; Path=/; SameSite=Lax\r\n\r\n").as_bytes(),
-        );
-        out.extend_from_slice(&buf[header_end + 4..]);
-        return out;
+    let Ok(header_str) = std::str::from_utf8(header_bytes) else {
+        return buf.to_vec();
+    };
+    if header_str.starts_with("HTTP/1.1 101") || header_str.starts_with("HTTP/1.0 101") {
+        return buf.to_vec();
     }
-    buf.to_vec()
+    let lower = header_str.to_ascii_lowercase();
+    let mut extra = String::new();
+    if let Some(cookie_kv) = session_cookie {
+        if !lower.contains("set-cookie: session_token=") {
+            extra.push_str(&format!(
+                "\r\nSet-Cookie: {cookie_kv}; Path=/; SameSite=Lax"
+            ));
+        }
+    }
+    if !lower.contains("\r\nconnection:") {
+        extra.push_str("\r\nConnection: close");
+    }
+    if extra.is_empty() {
+        return buf.to_vec();
+    }
+    let mut out = Vec::with_capacity(buf.len() + extra.len() + 4);
+    out.extend_from_slice(header_bytes);
+    out.extend_from_slice(extra.as_bytes());
+    out.extend_from_slice(b"\r\n\r\n");
+    out.extend_from_slice(&buf[header_end + 4..]);
+    out
 }
 
 pub struct ZellijWebManager {
@@ -351,11 +379,6 @@ async fn gather_candidates_and_punch(
             }
         }
     }
-    // Always include 127.0.0.1:<local_tcp_port> as a local candidate for same-host testing
-    let loopback_cand = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), local_tcp_port).to_string();
-    if !tcp_candidates.contains(&loopback_cand) {
-        tcp_candidates.push(loopback_cand);
-    }
 
     if let Ok(udp_sock) = UdpSocket::bind("0.0.0.0:0").await {
         if let Ok(local_udp) = udp_sock.local_addr() {
@@ -432,6 +455,14 @@ async fn handle_direct_p2p_tcp_stream(
     r2c_cipher.apply_keystream(&mut reply_auth);
     p2p_stream.write_all(&reply_auth).await?;
 
+    // Read the first chunk of request data; if EOF (0 bytes), this was a P2P reachability probe.
+    let mut first_buf = vec![0u8; 16384];
+    let first_n = match p2p_stream.read(&mut first_buf).await {
+        Ok(0) | Err(_) => return Ok(()),
+        Ok(n) => n,
+    };
+    c2r_cipher.apply_keystream(&mut first_buf[..first_n]);
+
     let session_cookie = web_mgr.ensure_running_and_get_cookie().await?;
     let local_addr = SocketAddr::from(([127, 0, 0, 1], web_mgr.web_port()));
     let zellij_stream = TcpStream::connect(local_addr)
@@ -442,9 +473,14 @@ async fn handle_direct_p2p_tcp_stream(
     let (mut z_rd, mut z_wr) = zellij_stream.into_split();
 
     let web_port = web_mgr.web_port();
-    let cookie_for_req = session_cookie.clone();
+    let rewritten_first = rewrite_http_request_for_zellij_web(
+        &first_buf[..first_n],
+        web_port,
+        session_cookie.as_deref(),
+    );
+    z_wr.write_all(&rewritten_first).await?;
+
     let c2r_task = tokio::spawn(async move {
-        let mut first_chunk = true;
         let mut buf = vec![0u8; 16384];
         loop {
             let n = match p2p_rd.read(&mut buf).await {
@@ -453,14 +489,7 @@ async fn handle_direct_p2p_tcp_stream(
             };
             let chunk = &mut buf[..n];
             c2r_cipher.apply_keystream(chunk);
-            if first_chunk {
-                first_chunk = false;
-                let rewritten =
-                    rewrite_http_request_for_zellij_web(chunk, web_port, cookie_for_req.as_deref());
-                if z_wr.write_all(&rewritten).await.is_err() {
-                    break;
-                }
-            } else if z_wr.write_all(chunk).await.is_err() {
+            if z_wr.write_all(chunk).await.is_err() {
                 break;
             }
         }
@@ -498,75 +527,75 @@ async fn handle_incoming_zellij_frame(
     frame: ZellijTunnelFrame,
     cfg: Arc<RelayConfig>,
     web_mgr: Arc<ZellijWebManager>,
-    active_tunnels: Arc<Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>,
+    active_tunnels: Arc<Mutex<HashMap<String, mpsc::Sender<Option<Vec<u8>>>>>>,
     outbound_tx: mpsc::Sender<RelayStreamMessage>,
 ) {
     match ZellijFrameType::try_from(frame.frame_type).unwrap_or(ZellijFrameType::Unspecified) {
         ZellijFrameType::P2pOffer => {
-            if let Err(e) = verify_zellij_tunnel_frame(
-                &frame,
-                NodeRole::Client,
-                &cfg.grant.user_pubkey,
-                now_unix_sec(),
-            ) {
-                tracing::warn!("Rejected P2P_OFFER with invalid signature: {}", e);
-                return;
-            }
-
-            let Some(offer) = P2pEndpointHandshake::from_bytes(&frame.payload) else {
-                tracing::warn!("Invalid P2P_OFFER JSON");
-                return;
-            };
-
-            let listener = match TcpListener::bind("0.0.0.0:0").await {
-                Ok(l) => l,
-                Err(e) => {
-                    tracing::warn!("Failed to bind P2P TCP listener: {}", e);
+            tokio::spawn(async move {
+                if let Err(e) = verify_zellij_tunnel_frame(
+                    &frame,
+                    NodeRole::Client,
+                    &cfg.grant.user_pubkey,
+                    now_unix_sec(),
+                ) {
+                    tracing::warn!("Rejected P2P_OFFER with invalid signature: {}", e);
                     return;
                 }
-            };
-            let local_port = match listener.local_addr() {
-                Ok(a) => a.port(),
-                Err(_) => return,
-            };
 
-            let (tcp_candidates, udp_candidates) = gather_candidates_and_punch(
-                &cfg.stun_servers,
-                local_port,
-                &offer.udp_candidates,
-            )
-            .await;
+                let Some(offer) = P2pEndpointHandshake::from_bytes(&frame.payload) else {
+                    tracing::warn!("Invalid P2P_OFFER JSON");
+                    return;
+                };
 
-            let answer = P2pEndpointHandshake::new(tcp_candidates, udp_candidates);
-            let answer_bytes = answer.to_bytes();
+                let listener = match TcpListener::bind("0.0.0.0:0").await {
+                    Ok(l) => l,
+                    Err(e) => {
+                        tracing::warn!("Failed to bind P2P TCP listener: {}", e);
+                        return;
+                    }
+                };
+                let local_port = match listener.local_addr() {
+                    Ok(a) => a.port(),
+                    Err(_) => return,
+                };
 
-            let mut reply_frame = ZellijTunnelFrame {
-                tunnel_id: frame.tunnel_id.clone(),
-                relay_node_id: cfg.grant.node_id.clone(),
-                client_node_id: frame.client_node_id.clone(),
-                frame_type: ZellijFrameType::P2pAnswer as i32,
-                payload: answer_bytes,
-                error_message: String::new(),
-                sender_grant: Some(cfg.grant.clone()),
-                sender_signature: Vec::new(),
-            };
-            let _ = sign_zellij_tunnel_frame(&mut reply_frame, &cfg.node_signing_key);
-
-            let (client_auth_token, relay_auth_token, cipher_key) = derive_p2p_session_keys(
-                &frame.tunnel_id,
-                &offer,
-                &frame.sender_signature,
-                &answer,
-                &reply_frame.sender_signature,
-            );
-
-            let _ = outbound_tx
-                .send(RelayStreamMessage {
-                    payload: Some(RelayOutPayload::ZellijFrame(reply_frame)),
-                })
+                let (tcp_candidates, udp_candidates) = gather_candidates_and_punch(
+                    &cfg.stun_servers,
+                    local_port,
+                    &offer.udp_candidates,
+                )
                 .await;
 
-            tokio::spawn(async move {
+                let answer = P2pEndpointHandshake::new(tcp_candidates, udp_candidates);
+                let answer_bytes = answer.to_bytes();
+
+                let mut reply_frame = ZellijTunnelFrame {
+                    tunnel_id: frame.tunnel_id.clone(),
+                    relay_node_id: cfg.grant.node_id.clone(),
+                    client_node_id: frame.client_node_id.clone(),
+                    frame_type: ZellijFrameType::P2pAnswer as i32,
+                    payload: answer_bytes,
+                    error_message: String::new(),
+                    sender_grant: Some(cfg.grant.clone()),
+                    sender_signature: Vec::new(),
+                };
+                let _ = sign_zellij_tunnel_frame(&mut reply_frame, &cfg.node_signing_key);
+
+                let (client_auth_token, relay_auth_token, cipher_key) = derive_p2p_session_keys(
+                    &frame.tunnel_id,
+                    &offer,
+                    &frame.sender_signature,
+                    &answer,
+                    &reply_frame.sender_signature,
+                );
+
+                let _ = outbound_tx
+                    .send(RelayStreamMessage {
+                        payload: Some(RelayOutPayload::ZellijFrame(reply_frame)),
+                    })
+                    .await;
+
                 let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
                 loop {
                     tokio::select! {
@@ -605,85 +634,92 @@ async fn handle_incoming_zellij_frame(
             let client_node_id = frame.client_node_id.clone();
             let relay_node_id = cfg.grant.node_id.clone();
 
-            let session_cookie = match web_mgr.ensure_running_and_get_cookie().await {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = outbound_tx
-                        .send(RelayStreamMessage {
-                            payload: Some(RelayOutPayload::ZellijFrame(ZellijTunnelFrame {
-                                tunnel_id,
-                                relay_node_id,
-                                client_node_id,
-                                frame_type: ZellijFrameType::Close as i32,
-                                payload: Vec::new(),
-                                error_message: format!("failed to start zellij web: {e}"),
-                                sender_grant: None,
-                                sender_signature: Vec::new(),
-                            })),
-                        })
-                        .await;
-                    return;
-                }
-            };
-
-            let addr = SocketAddr::from(([127, 0, 0, 1], web_mgr.web_port()));
-            let tcp_stream = match TcpStream::connect(addr).await {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = outbound_tx
-                        .send(RelayStreamMessage {
-                            payload: Some(RelayOutPayload::ZellijFrame(ZellijTunnelFrame {
-                                tunnel_id,
-                                relay_node_id,
-                                client_node_id,
-                                frame_type: ZellijFrameType::Close as i32,
-                                payload: Vec::new(),
-                                error_message: format!("failed to connect to zellij web on {addr}: {e}"),
-                                sender_grant: None,
-                                sender_signature: Vec::new(),
-                            })),
-                        })
-                        .await;
-                    return;
-                }
-            };
-
-            let (mut z_rd, mut z_wr) = tcp_stream.into_split();
-            let (in_tx, mut in_rx) = mpsc::channel::<Vec<u8>>(128);
+            // Synchronously register the tunnel channel BEFORE spawning so subsequent DATA/CLOSE
+            // frames on the gRPC stream are guaranteed to find this tunnel in strict FIFO order.
+            let (in_tx, mut in_rx) = mpsc::channel::<Option<Vec<u8>>>(1024);
+            if !frame.payload.is_empty() {
+                let _ = in_tx.try_send(Some(frame.payload));
+            }
             active_tunnels
                 .lock()
                 .await
-                .insert(tunnel_id.clone(), in_tx.clone());
+                .insert(tunnel_id.clone(), in_tx);
 
-            if !frame.payload.is_empty() {
-                let _ = in_tx.send(frame.payload).await;
-            }
-
-            let web_port = web_mgr.web_port();
-            let cookie_for_req = session_cookie.clone();
             tokio::spawn(async move {
-                let mut first = true;
-                while let Some(chunk) = in_rx.recv().await {
-                    let to_write = if first {
-                        first = false;
-                        rewrite_http_request_for_zellij_web(
-                            &chunk,
-                            web_port,
-                            cookie_for_req.as_deref(),
-                        )
-                    } else {
-                        chunk
-                    };
-                    if z_wr.write_all(&to_write).await.is_err() {
-                        break;
+                let session_cookie = match web_mgr.ensure_running_and_get_cookie().await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        active_tunnels.lock().await.remove(&tunnel_id);
+                        let _ = outbound_tx
+                            .send(RelayStreamMessage {
+                                payload: Some(RelayOutPayload::ZellijFrame(ZellijTunnelFrame {
+                                    tunnel_id,
+                                    relay_node_id,
+                                    client_node_id,
+                                    frame_type: ZellijFrameType::Close as i32,
+                                    payload: Vec::new(),
+                                    error_message: format!("failed to start zellij web: {e}"),
+                                    sender_grant: None,
+                                    sender_signature: Vec::new(),
+                                })),
+                            })
+                            .await;
+                        return;
                     }
-                }
-                let _ = z_wr.shutdown().await;
-            });
+                };
 
-            let tunnels_cleanup = Arc::clone(&active_tunnels);
-            let cookie_for_resp = session_cookie;
-            tokio::spawn(async move {
+                let addr = SocketAddr::from(([127, 0, 0, 1], web_mgr.web_port()));
+                let tcp_stream = match TcpStream::connect(addr).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        active_tunnels.lock().await.remove(&tunnel_id);
+                        let _ = outbound_tx
+                            .send(RelayStreamMessage {
+                                payload: Some(RelayOutPayload::ZellijFrame(ZellijTunnelFrame {
+                                    tunnel_id,
+                                    relay_node_id,
+                                    client_node_id,
+                                    frame_type: ZellijFrameType::Close as i32,
+                                    payload: Vec::new(),
+                                    error_message: format!(
+                                        "failed to connect to zellij web on {addr}: {e}"
+                                    ),
+                                    sender_grant: None,
+                                    sender_signature: Vec::new(),
+                                })),
+                            })
+                            .await;
+                        return;
+                    }
+                };
+
+                let (mut z_rd, mut z_wr) = tcp_stream.into_split();
+                let web_port = web_mgr.web_port();
+                let cookie_for_req = session_cookie.clone();
+                tokio::spawn(async move {
+                    let mut first = true;
+                    while let Some(item) = in_rx.recv().await {
+                        let Some(chunk) = item else {
+                            break;
+                        };
+                        let to_write = if first {
+                            first = false;
+                            rewrite_http_request_for_zellij_web(
+                                &chunk,
+                                web_port,
+                                cookie_for_req.as_deref(),
+                            )
+                        } else {
+                            chunk
+                        };
+                        if z_wr.write_all(&to_write).await.is_err() {
+                            break;
+                        }
+                    }
+                    let _ = z_wr.shutdown().await;
+                });
+
+                let cookie_for_resp = session_cookie;
                 let mut first = true;
                 let mut buf = vec![0u8; 16384];
                 loop {
@@ -722,7 +758,7 @@ async fn handle_incoming_zellij_frame(
                         }
                     }
                 }
-                tunnels_cleanup.lock().await.remove(&tunnel_id);
+                active_tunnels.lock().await.remove(&tunnel_id);
                 let _ = outbound_tx
                     .send(RelayStreamMessage {
                         payload: Some(RelayOutPayload::ZellijFrame(ZellijTunnelFrame {
@@ -742,11 +778,14 @@ async fn handle_incoming_zellij_frame(
         ZellijFrameType::Data => {
             let tx_opt = active_tunnels.lock().await.get(&frame.tunnel_id).cloned();
             if let Some(tx) = tx_opt {
-                let _ = tx.send(frame.payload).await;
+                let _ = tx.send(Some(frame.payload)).await;
             }
         }
         ZellijFrameType::Close => {
-            active_tunnels.lock().await.remove(&frame.tunnel_id);
+            let tx_opt = active_tunnels.lock().await.remove(&frame.tunnel_id);
+            if let Some(tx) = tx_opt {
+                let _ = tx.send(None).await;
+            }
         }
         _ => {}
     }
@@ -774,7 +813,7 @@ async fn run_single_coordinator_relay_stream(
     let channel = endpoint.connect().await?;
     let mut grpc_client = SockcastServiceClient::new(channel);
 
-    let (out_tx, out_rx) = mpsc::channel::<RelayStreamMessage>(256);
+    let (out_tx, out_rx) = mpsc::channel::<RelayStreamMessage>(1024);
 
     let auth = create_node_auth(
         cfg.grant.clone(),
@@ -810,7 +849,7 @@ async fn run_single_coordinator_relay_stream(
         initial_sessions.len()
     );
 
-    let active_tunnels: Arc<Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>> =
+    let active_tunnels: Arc<Mutex<HashMap<String, mpsc::Sender<Option<Vec<u8>>>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let mut last_sessions = initial_sessions;
     let mut status_ticker = tokio::time::interval(Duration::from_secs(10));
@@ -856,13 +895,14 @@ async fn run_single_coordinator_relay_stream(
                         }).await;
                     }
                     Some(ServerInPayload::ZellijFrame(frame)) => {
-                        let cfg_c = Arc::clone(&cfg);
-                        let mgr_c = Arc::clone(&web_mgr);
-                        let tun_c = Arc::clone(&active_tunnels);
-                        let tx_c = out_tx.clone();
-                        tokio::spawn(async move {
-                            handle_incoming_zellij_frame(frame, cfg_c, mgr_c, tun_c, tx_c).await;
-                        });
+                        handle_incoming_zellij_frame(
+                            frame,
+                            Arc::clone(&cfg),
+                            Arc::clone(&web_mgr),
+                            Arc::clone(&active_tunnels),
+                            out_tx.clone(),
+                        )
+                        .await;
                     }
                     _ => {}
                 }
