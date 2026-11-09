@@ -21,6 +21,7 @@ use sockcast_relay::proc_inspector::{
 use sockcast_relay::zellij::{
     inject_set_cookie_into_http_response, parse_zellij_create_token_output,
     parse_zellij_list_sessions_output, rewrite_http_request_for_zellij_web,
+    rewrite_websocket_normal_close_to_4001,
 };
 use std::os::unix::fs::PermissionsExt;
 use std::pin::Pin;
@@ -443,4 +444,8 @@ build-rpm [Created 1d ago] (EXITED - attach to resurrect)
     let resp_str = String::from_utf8(resp_injected).unwrap();
     assert!(resp_str.contains("Set-Cookie: session_token=abc123; Path=/; SameSite=Lax\r\n"));
     assert!(resp_str.ends_with("\r\n\r\n<html></html>"));
+
+    let mut ws_close = b"\x88\x13\x03\xe8Connection closed".to_vec();
+    rewrite_websocket_normal_close_to_4001(&mut ws_close);
+    assert_eq!(&ws_close, b"\x88\x13\x0f\xa1Connection closed");
 }

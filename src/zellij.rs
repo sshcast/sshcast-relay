@@ -190,8 +190,50 @@ pub fn rewrite_http_request_for_zellij_web(
     out
 }
 
+const WS_NORMAL_CLOSE_FRAME: &[u8; 21] = b"\x88\x13\x03\xe8Connection closed";
+const WS_DISCONNECTED_CLOSE_FRAME: &[u8; 21] = b"\x88\x13\x0f\xa1Connection closed";
+
+const ZELLIJ_HTML_EXIT_HOOK: &str = r#"<script>
+window.addEventListener("DOMContentLoaded", () => {
+  const origShowError = window.showErrorModal;
+  if (typeof origShowError === "function") {
+    window.showErrorModal = async function(title, desc) {
+      if (title === "Disconnected") {
+        await origShowError("Session Ended", "The Zellij session has exited. Press Enter or Escape to return to the session list.");
+        const port = window.location.port ? ":" + window.location.port : "";
+        window.location.href = window.location.protocol + "//localhost" + port + "/";
+        return;
+      }
+      return origShowError(title, desc);
+    };
+  }
+});
+</script></body>"#;
+
+/// Rewrites `zellij web`'s unmasked WebSocket `CloseFrame { code: 1000, reason: "Connection closed" }`
+/// (`\x88\x13\x03\xe8Connection closed`) to close code `4001` (`\x88\x13\x0f\xa1Connection closed`).
+/// Upstream `zellij web` sends close code `1000` on normal session exit (`ExitReason::Normal`),
+/// which causes `app.js` (`if (event.code === 4001) handleDisconnected() else handleReconnection()`)
+/// to treat a closed session as a network drop, reload `/<session>`, and immediately recreate it.
+pub fn rewrite_websocket_normal_close_to_4001(buf: &mut [u8]) {
+    if buf.len() < WS_NORMAL_CLOSE_FRAME.len() {
+        return;
+    }
+    let mut i = 0;
+    while i + WS_NORMAL_CLOSE_FRAME.len() <= buf.len() {
+        if &buf[i..i + WS_NORMAL_CLOSE_FRAME.len()] == WS_NORMAL_CLOSE_FRAME {
+            buf[i..i + WS_DISCONNECTED_CLOSE_FRAME.len()]
+                .copy_from_slice(WS_DISCONNECTED_CLOSE_FRAME);
+            i += WS_DISCONNECTED_CLOSE_FRAME.len();
+        } else {
+            i += 1;
+        }
+    }
+}
+
 /// Injects `Set-Cookie: session_token=...; Path=/; SameSite=Lax` (and `Connection: close` on non-101 responses)
 /// into an HTTP response header block if not already present so the browser stores the cookie locally as well.
+/// Also injects a lightweight session-exit hook into `index.html` so exiting a session returns to the dashboard.
 pub fn inject_set_cookie_into_http_response(
     buf: &[u8],
     session_cookie: Option<&str>,
@@ -209,6 +251,16 @@ pub fn inject_set_cookie_into_http_response(
     if header_str.starts_with("HTTP/1.1 101") || header_str.starts_with("HTTP/1.0 101") {
         return buf.to_vec();
     }
+
+    let body_bytes = &buf[header_end + 4..];
+    let mut rewritten_body: Option<Vec<u8>> = None;
+    if let Ok(body_str) = std::str::from_utf8(body_bytes) {
+        if body_str.contains("assets/app.js") && body_str.contains("</body>") {
+            let new_body = body_str.replacen("</body>", ZELLIJ_HTML_EXIT_HOOK, 1);
+            rewritten_body = Some(new_body.into_bytes());
+        }
+    }
+
     let lower = header_str.to_ascii_lowercase();
     let mut extra = String::new();
     if let Some(cookie_kv) = session_cookie {
@@ -221,14 +273,31 @@ pub fn inject_set_cookie_into_http_response(
     if !lower.contains("\r\nconnection:") {
         extra.push_str("\r\nConnection: close");
     }
-    if extra.is_empty() {
+    if extra.is_empty() && rewritten_body.is_none() {
         return buf.to_vec();
     }
-    let mut out = Vec::with_capacity(buf.len() + extra.len() + 4);
-    out.extend_from_slice(header_bytes);
-    out.extend_from_slice(extra.as_bytes());
-    out.extend_from_slice(b"\r\n\r\n");
-    out.extend_from_slice(&buf[header_end + 4..]);
+
+    let final_body = rewritten_body.as_deref().unwrap_or(body_bytes);
+    let mut out_headers = String::with_capacity(header_str.len() + extra.len() + 64);
+    for (idx, line) in header_str.split("\r\n").enumerate() {
+        if idx > 0 {
+            out_headers.push_str("\r\n");
+        }
+        if rewritten_body.is_some() {
+            if let Some((k, _)) = line.split_once(':') {
+                if k.trim().eq_ignore_ascii_case("content-length") {
+                    out_headers.push_str(&format!("content-length: {}", final_body.len()));
+                    continue;
+                }
+            }
+        }
+        out_headers.push_str(line);
+    }
+    out_headers.push_str(&extra);
+    out_headers.push_str("\r\n\r\n");
+
+    let mut out = out_headers.into_bytes();
+    out.extend_from_slice(final_body);
     out
 }
 
@@ -497,8 +566,9 @@ async fn handle_direct_p2p_tcp_stream(
     });
 
     let cookie_for_resp = session_cookie;
-    let r2c_task = tokio::spawn(async move {
+    let mut r2c_task = tokio::spawn(async move {
         let mut first_chunk = true;
+        let mut is_ws = false;
         let mut buf = vec![0u8; 16384];
         loop {
             let n = match z_rd.read(&mut buf).await {
@@ -507,10 +577,16 @@ async fn handle_direct_p2p_tcp_stream(
             };
             let mut out_bytes = if first_chunk {
                 first_chunk = false;
+                if buf[..n].starts_with(b"HTTP/1.1 101") || buf[..n].starts_with(b"HTTP/1.0 101") {
+                    is_ws = true;
+                }
                 inject_set_cookie_into_http_response(&buf[..n], cookie_for_resp.as_deref())
             } else {
                 buf[..n].to_vec()
             };
+            if is_ws {
+                rewrite_websocket_normal_close_to_4001(&mut out_bytes);
+            }
             r2c_cipher.apply_keystream(&mut out_bytes);
             if p2p_wr.write_all(&out_bytes).await.is_err() {
                 break;
@@ -519,7 +595,8 @@ async fn handle_direct_p2p_tcp_stream(
         let _ = p2p_wr.shutdown().await;
     });
 
-    let _ = tokio::join!(c2r_task, r2c_task);
+    let _ = &mut r2c_task.await;
+    let _ = tokio::time::timeout(Duration::from_millis(150), c2r_task).await;
     Ok(())
 }
 
@@ -721,13 +798,19 @@ async fn handle_incoming_zellij_frame(
 
                 let cookie_for_resp = session_cookie;
                 let mut first = true;
+                let mut is_ws = false;
                 let mut buf = vec![0u8; 16384];
                 loop {
                     match z_rd.read(&mut buf).await {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
-                            let payload = if first {
+                            let mut payload = if first {
                                 first = false;
+                                if buf[..n].starts_with(b"HTTP/1.1 101")
+                                    || buf[..n].starts_with(b"HTTP/1.0 101")
+                                {
+                                    is_ws = true;
+                                }
                                 inject_set_cookie_into_http_response(
                                     &buf[..n],
                                     cookie_for_resp.as_deref(),
@@ -735,6 +818,9 @@ async fn handle_incoming_zellij_frame(
                             } else {
                                 buf[..n].to_vec()
                             };
+                            if is_ws {
+                                rewrite_websocket_normal_close_to_4001(&mut payload);
+                            }
                             if outbound_tx
                                 .send(RelayStreamMessage {
                                     payload: Some(RelayOutPayload::ZellijFrame(
