@@ -10,9 +10,10 @@ use sockcast_proto::v1::{
     GetIdentitiesRequest, ProcessContext, PublicKey, SignRequest, SignResponse,
 };
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
 use crate::config::RelayConfig;
@@ -39,8 +40,10 @@ struct MemoryKeyCache {
 pub struct CoordinatorClient {
     cfg: RelayConfig,
     channels: RwLock<Vec<Option<Channel>>>,
+    connect_lock: Mutex<()>,
     preferred_idx: AtomicUsize,
     key_cache: RwLock<MemoryKeyCache>,
+    refresh_in_flight: AtomicBool,
 }
 
 impl CoordinatorClient {
@@ -54,11 +57,13 @@ impl CoordinatorClient {
         Self {
             cfg,
             channels: RwLock::new(init_channels),
+            connect_lock: Mutex::new(()),
             preferred_idx: AtomicUsize::new(0),
             key_cache: RwLock::new(MemoryKeyCache {
                 keys: initial_keys,
                 fetched_at: None,
             }),
+            refresh_in_flight: AtomicBool::new(false),
         }
     }
 
@@ -74,6 +79,14 @@ impl CoordinatorClient {
     }
 
     async fn get_or_connect_channel(&self, idx: usize) -> Result<Channel> {
+        {
+            let guard = self.channels.read().await;
+            if let Some(Some(ch)) = guard.get(idx) {
+                return Ok(ch.clone());
+            }
+        }
+
+        let _conn_guard = self.connect_lock.lock().await;
         {
             let guard = self.channels.read().await;
             if let Some(Some(ch)) = guard.get(idx) {
@@ -132,23 +145,54 @@ impl CoordinatorClient {
         }
     }
 
-    /// Returns cached public keys if within TTL, or queries `GetIdentities` across configured
-    /// `sockcast-server` endpoints with automatic failover and disk cache fallback.
-    pub async fn get_identities(&self) -> Vec<PublicKey> {
+    /// Returns cached public keys immediately (0ms) using stale-while-revalidate when cached keys
+    /// are available in memory or on disk, or queries `GetIdentities` synchronously on first cold boot.
+    pub async fn get_identities(self: &Arc<Self>) -> Vec<PublicKey> {
         let ttl = Duration::from_secs(self.cfg.key_cache_ttl_secs);
         if ttl > Duration::ZERO {
             let guard = self.key_cache.read().await;
-            if let Some(fetched_at) = guard.fetched_at {
-                if fetched_at.elapsed() < ttl && !guard.keys.is_empty() {
+            if !guard.keys.is_empty() {
+                let is_fresh = guard
+                    .fetched_at
+                    .map(|t| t.elapsed() < ttl)
+                    .unwrap_or(false);
+                let cached = guard.keys.clone();
+                drop(guard);
+
+                if is_fresh {
                     tracing::info!(
-                        "GetIdentities served {} key(s) from memory cache in 0ms",
-                        guard.keys.len()
+                        "GetIdentities served {} key(s) from fresh memory cache in 0ms",
+                        cached.len()
                     );
-                    return guard.keys.clone();
+                } else {
+                    tracing::info!(
+                        "GetIdentities served {} key(s) from cache in 0ms (revalidating in background)",
+                        cached.len()
+                    );
+                    self.spawn_background_refresh();
                 }
+                return cached;
             }
         }
 
+        self.refresh_identities_now().await
+    }
+
+    fn spawn_background_refresh(self: &Arc<Self>) {
+        if self
+            .refresh_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let me = Arc::clone(self);
+            tokio::spawn(async move {
+                let _ = me.refresh_identities_now().await;
+                me.refresh_in_flight.store(false, Ordering::Release);
+            });
+        }
+    }
+
+    async fn refresh_identities_now(&self) -> Vec<PublicKey> {
         let t_id = Instant::now();
         match self.fetch_identities_remote().await {
             Ok(remote_keys) if !remote_keys.is_empty() => {

@@ -53,7 +53,7 @@ where
 /// Processes a single SSH agent request payload and returns the response payload (excluding the 4-byte length prefix).
 pub async fn process_agent_frame(
     frame: &[u8],
-    coord: &CoordinatorClient,
+    coord: &Arc<CoordinatorClient>,
     process_context: &ProcessContext,
 ) -> Vec<u8> {
     let Some((&msg_type, body)) = frame.split_first() else {
