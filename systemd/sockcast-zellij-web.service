@@ -5,6 +5,7 @@ After=network.target
 
 [Service]
 Type=simple
+Environment=TERM=xterm-256color
 ExecStart=/usr/bin/zellij web --ip 127.0.0.1 --port 8082
 Restart=on-failure
 RestartSec=2

@@ -33,6 +33,7 @@ After=sockcast-relay.socket network-online.target
 
 [Service]
 Type=simple
+Environment=TERM=xterm-256color
 ExecStart={binary_path} run
 Restart=no
 NoNewPrivileges=yes
@@ -53,6 +54,7 @@ After=network.target
 
 [Service]
 Type=simple
+Environment=TERM=xterm-256color
 ExecStart=/usr/bin/zellij web --ip 127.0.0.1 --port {port}
 Restart=on-failure
 RestartSec=2

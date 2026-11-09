@@ -465,6 +465,7 @@ impl ZellijWebManager {
                         .args([
                             "--user",
                             &format!("--unit={unit_name}"),
+                            "--setenv=TERM=xterm-256color",
                             "--property=KillMode=process",
                             "--property=Restart=on-failure",
                             "--collect",
@@ -495,6 +496,7 @@ impl ZellijWebManager {
 
                 if !self.is_port_listening().await {
                     let _ = Command::new("zellij")
+                        .env("TERM", "xterm-256color")
                         .args([
                             "web",
                             "--ip",

@@ -101,3 +101,16 @@ Because `handleReconnection()` checks `/info/version` and calls `window.location
 
 ### Proposed Upstream Fix
 In `zellij-client/src/web_client/server_listener.rs` (`handle_exit_reason`), any terminal `ExitReason` from the server (`ExitReason::Normal`, `ExitReason::NormalDetached`, `ExitReason::ForceDetached`, `ExitReason::WebClientsForbidden`, `ExitReason::Error(_)`, `ExitReason::KickedByHost`) should set `should_not_reconnect` (or use a dedicated close code such as `4000` for normal session exit vs `4001` for kicked by host) so the browser does not auto-reload `/<session_name>` and resurrect/recreate an intentionally exited session.
+
+---
+
+## 3. `env { ... }` in `config.kdl` Ignored by `zellij web` in Zellij 0.45.1
+
+### Problem
+In Zellij 0.45.1:
+- `config.env.set_vars()` (which applies `env { ... }` from `config.kdl` to the process environment via `std::env::set_var`) is only called in `zellij-client/src/lib.rs:992` (`start_client`) and `zellij-client/src/lib.rs:1646` (`start_server_detached`).
+- `start_web_client` in `zellij-client/src/web_client/mod.rs` never calls `config.env.set_vars()`, and `zellij-server` in 0.45.1 simply inherits the spawning process's environment in `handle_openpty` (`zellij-server/src/os_input_output_unix.rs:228–259`).
+- As a result, in Zellij 0.45.1, any session spawned from the `zellij web` launcher ignores the `env { ... }` block in `config.kdl`. (Combined with `systemd --user` services not setting `TERM` by default, panes in web-created sessions end up with an empty `TERM` unless `Environment=TERM=xterm-256color` is set on the service unit.)
+
+### Upstream Status
+Fixed on upstream `main` (post-0.45.1, commit `201c1593d`, PR `#5685`) by introducing `AppliedEnv::at_startup(config.env.inner())` in `zellij-server/src/lib.rs:5509` and passing `pane_env` directly into `handle_openpty` (`zellij-server/src/os_input_output_unix.rs:241–246`).
