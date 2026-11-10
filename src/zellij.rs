@@ -1499,27 +1499,18 @@ async fn run_single_coordinator_relay_stream(
     }
 }
 
-/// Runs the persistent outbound `ConnectRelay` stream loop when `cfg.zellij_enabled` is `true`.
-pub async fn run_zellij_relay_worker(
-    cfg: RelayConfig,
+async fn run_coordinator_relay_stream_loop(
+    server_url: String,
+    cfg: Arc<RelayConfig>,
+    web_mgr: Arc<ZellijWebManager>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
-    if !cfg.zellij_enabled || cfg.servers.is_empty() {
-        return;
-    }
-    let cfg = Arc::new(cfg);
-    let web_mgr = Arc::new(ZellijWebManager::new(cfg.zellij_web_port));
-    let mut server_idx = 0usize;
-
     loop {
         if *shutdown_rx.borrow() {
             return;
         }
-        let server_url = &cfg.servers[server_idx % cfg.servers.len()];
-        server_idx = server_idx.wrapping_add(1);
-
         if let Err(e) = run_single_coordinator_relay_stream(
-            server_url,
+            &server_url,
             Arc::clone(&cfg),
             Arc::clone(&web_mgr),
             shutdown_rx.clone(),
@@ -1541,5 +1532,108 @@ pub async fn run_zellij_relay_worker(
             }
             _ = tokio::time::sleep(Duration::from_secs(2)) => {}
         }
+    }
+}
+
+/// Runs the persistent outbound `ConnectRelay` stream loop when `cfg.zellij_enabled` is `true`,
+/// dynamically discovering and updating coordinators via `_sshcast` DNS TXT records when configured.
+pub async fn run_zellij_relay_worker(
+    cfg: RelayConfig,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    if !cfg.zellij_enabled || cfg.servers.is_empty() {
+        return;
+    }
+    let has_dns_discovery = cfg
+        .servers
+        .iter()
+        .any(|s| sshcast_proto::dns::is_dns_discovery_entry(s).is_some());
+    let configured_servers = cfg.servers.clone();
+    let cfg = Arc::new(cfg);
+    let web_mgr = Arc::new(ZellijWebManager::new(cfg.zellij_web_port));
+
+    let mut active_workers: HashMap<String, (watch::Sender<bool>, tokio::task::JoinHandle<()>)> =
+        HashMap::new();
+
+    let initial_urls = {
+        let s = configured_servers.clone();
+        tokio::task::spawn_blocking(move || sshcast_proto::dns::resolve_coordinator_servers(&s))
+            .await
+            .unwrap_or_default()
+    };
+
+    for server_url in initial_urls {
+        let (worker_stop_tx, worker_stop_rx) = watch::channel(false);
+        let cfg_clone = Arc::clone(&cfg);
+        let web_mgr_clone = Arc::clone(&web_mgr);
+        let url_clone = server_url.clone();
+        let handle = tokio::spawn(async move {
+            run_coordinator_relay_stream_loop(url_clone, cfg_clone, web_mgr_clone, worker_stop_rx)
+                .await;
+        });
+        active_workers.insert(server_url, (worker_stop_tx, handle));
+    }
+
+    let mut dns_ticker = tokio::time::interval(Duration::from_secs(60));
+    dns_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    dns_ticker.tick().await;
+
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+            _ = dns_ticker.tick(), if has_dns_discovery => {
+                let s = configured_servers.clone();
+                let resolved = tokio::task::spawn_blocking(move || {
+                    sshcast_proto::dns::resolve_coordinator_servers(&s)
+                })
+                .await
+                .unwrap_or_default();
+                if !resolved.is_empty() {
+                    let current_urls: Vec<String> = active_workers.keys().cloned().collect();
+                    for old_url in current_urls {
+                        if !resolved.contains(&old_url) {
+                            tracing::info!(
+                                "Coordinator {} removed from _sshcast DNS TXT; stopping ConnectRelay stream",
+                                old_url
+                            );
+                            if let Some((stop_tx, _)) = active_workers.remove(&old_url) {
+                                let _ = stop_tx.send(true);
+                            }
+                        }
+                    }
+                    for new_url in resolved {
+                        if !active_workers.contains_key(&new_url) {
+                            tracing::info!(
+                                "Coordinator {} added via _sshcast DNS TXT; starting ConnectRelay stream",
+                                new_url
+                            );
+                            let (worker_stop_tx, worker_stop_rx) = watch::channel(false);
+                            let cfg_clone = Arc::clone(&cfg);
+                            let web_mgr_clone = Arc::clone(&web_mgr);
+                            let url_clone = new_url.clone();
+                            let handle = tokio::spawn(async move {
+                                run_coordinator_relay_stream_loop(
+                                    url_clone,
+                                    cfg_clone,
+                                    web_mgr_clone,
+                                    worker_stop_rx,
+                                )
+                                .await;
+                            });
+                            active_workers.insert(new_url, (worker_stop_tx, handle));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for (_, (stop_tx, handle)) in active_workers {
+        let _ = stop_tx.send(true);
+        let _ = handle.await;
     }
 }

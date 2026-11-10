@@ -58,6 +58,16 @@ enum Commands {
         #[command(subcommand)]
         action: ZellijAction,
     },
+    /// Import an operator-signed user certificate (`sc_cert_<base64>`) into `relay.toml`
+    ImportCert {
+        /// Operator-signed user certificate token (`sc_cert_<base64>`)
+        #[arg(long)]
+        cert: String,
+
+        /// Optional custom path for `relay.toml` (defaults to `~/.config/sshcast/relay.toml`)
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -208,5 +218,18 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
+        Commands::ImportCert { cert, config } => {
+            let (cfg_path, user_cert) = RelayConfig::import_user_cert(config.as_deref(), &cert)?;
+            println!(
+                "Imported operator-signed certificate into {}",
+                cfg_path.display()
+            );
+            println!("  User ID:         {}", user_cert.user_id);
+            println!(
+                "  Operator Pubkey: sc_op_pub_{}",
+                hex::encode(&user_cert.operator_pubkey)
+            );
+            Ok(())
+        }
     }
 }

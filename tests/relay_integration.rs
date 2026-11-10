@@ -122,6 +122,7 @@ fn test_init_bundle_writes_config_and_conditional_systemd_units() {
         issued_at_unix_sec: now_sec - 60,
         expires_at_unix_sec: 0,
         user_signature: Vec::new(),
+        user_cert: None,
     };
     sign_node_grant(&mut grant, &user_sk);
 
@@ -286,6 +287,7 @@ async fn test_end_to_end_agent_session_failover_and_idle_timeout() {
         issued_at_unix_sec: now_sec - 60,
         expires_at_unix_sec: 0,
         user_signature: Vec::new(),
+        user_cert: None,
     };
     sign_node_grant(&mut grant, &user_sk);
 

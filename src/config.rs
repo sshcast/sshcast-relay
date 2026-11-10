@@ -205,6 +205,48 @@ impl RelayConfig {
             .with_context(|| format!("failed to write {}", cfg_path.display()))?;
         Ok(cfg_path)
     }
+
+    pub fn import_user_cert(
+        path: Option<&Path>,
+        cert_token: &str,
+    ) -> Result<(PathBuf, sshcast_proto::v1::UserCert)> {
+        let cert = sshcast_proto::bundle::decode_user_cert_token(cert_token)?;
+        let now_sec = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        sshcast_proto::crypto::verify_user_cert(&cert, &cert.user_pubkey, now_sec)?;
+
+        let cfg_path = match path {
+            Some(p) => p.to_path_buf(),
+            None => default_config_path()?,
+        };
+        let raw = std::fs::read_to_string(&cfg_path)
+            .with_context(|| format!("failed to read relay config {}", cfg_path.display()))?;
+        let mut file: RelayConfigFile =
+            toml::from_str(&raw).context("failed to parse relay.toml")?;
+        let grant_bytes = URL_SAFE_NO_PAD
+            .decode(file.grant_proto_b64.trim())
+            .context("invalid base64 in grant_proto_b64")?;
+        let mut grant = NodeGrant::decode(grant_bytes.as_slice())
+            .context("failed to decode NodeGrant protobuf")?;
+        if grant.user_pubkey != cert.user_pubkey {
+            anyhow::bail!(
+                "UserCert user_pubkey ({}) does not match relay grant user_pubkey ({})",
+                hex::encode(&cert.user_pubkey),
+                hex::encode(&grant.user_pubkey)
+            );
+        }
+        grant.user_cert = Some(cert.clone());
+        let mut new_grant_bytes = Vec::new();
+        grant.encode(&mut new_grant_bytes)?;
+        file.grant_proto_b64 = URL_SAFE_NO_PAD.encode(new_grant_bytes);
+        let toml_str =
+            toml::to_string_pretty(&file).context("failed to serialize relay.toml")?;
+        std::fs::write(&cfg_path, &toml_str)
+            .with_context(|| format!("failed to write {}", cfg_path.display()))?;
+        Ok((cfg_path, cert))
+    }
 }
 
 pub fn current_euid() -> u32 {

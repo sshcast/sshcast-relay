@@ -9,6 +9,7 @@ use sshcast_proto::v1::sshcast_service_client::SshcastServiceClient;
 use sshcast_proto::v1::{
     GetIdentitiesRequest, ProcessContext, PublicKey, SignRequest, SignResponse,
 };
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -17,6 +18,8 @@ use tokio::sync::{Mutex, RwLock};
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
 use crate::config::RelayConfig;
+
+const DNS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedPublicKeyDisk {
@@ -37,9 +40,16 @@ struct MemoryKeyCache {
     fetched_at: Option<Instant>,
 }
 
+struct ResolvedServersCache {
+    urls: Vec<String>,
+    resolved_at: Option<Instant>,
+}
+
 pub struct CoordinatorClient {
     cfg: RelayConfig,
-    channels: RwLock<Vec<Option<Channel>>>,
+    has_dns_discovery: bool,
+    resolved_servers: RwLock<ResolvedServersCache>,
+    channels: RwLock<HashMap<String, Channel>>,
     connect_lock: Mutex<()>,
     preferred_idx: AtomicUsize,
     key_cache: RwLock<MemoryKeyCache>,
@@ -48,15 +58,29 @@ pub struct CoordinatorClient {
 
 impl CoordinatorClient {
     pub fn new(cfg: RelayConfig) -> Self {
-        let num_servers = cfg.servers.len();
-        let mut init_channels = Vec::with_capacity(num_servers);
-        init_channels.resize_with(num_servers, || None);
+        let has_dns_discovery = cfg
+            .servers
+            .iter()
+            .any(|s| sshcast_proto::dns::is_dns_discovery_entry(s).is_some());
+        let initial_urls = if has_dns_discovery {
+            Vec::new()
+        } else {
+            cfg.servers
+                .iter()
+                .filter_map(|s| sshcast_proto::dns::normalize_coordinator_url(s))
+                .collect()
+        };
 
         let initial_keys = load_disk_pubkey_cache(&cfg.pubkey_cache_path).unwrap_or_default();
 
         Self {
             cfg,
-            channels: RwLock::new(init_channels),
+            has_dns_discovery,
+            resolved_servers: RwLock::new(ResolvedServersCache {
+                urls: initial_urls,
+                resolved_at: None,
+            }),
+            channels: RwLock::new(HashMap::new()),
             connect_lock: Mutex::new(()),
             preferred_idx: AtomicUsize::new(0),
             key_cache: RwLock::new(MemoryKeyCache {
@@ -78,10 +102,47 @@ impl CoordinatorClient {
             .as_millis() as u64
     }
 
-    async fn get_or_connect_channel(&self, idx: usize) -> Result<Channel> {
+    async fn get_active_server_urls(&self) -> Vec<String> {
+        if !self.has_dns_discovery {
+            let guard = self.resolved_servers.read().await;
+            return guard.urls.clone();
+        }
+        {
+            let guard = self.resolved_servers.read().await;
+            if !guard.urls.is_empty() {
+                if let Some(t) = guard.resolved_at {
+                    if t.elapsed() < DNS_REFRESH_INTERVAL {
+                        return guard.urls.clone();
+                    }
+                }
+            }
+        }
+        let configured = self.cfg.servers.clone();
+        let resolved = tokio::task::spawn_blocking(move || {
+            sshcast_proto::dns::resolve_coordinator_servers(&configured)
+        })
+        .await
+        .unwrap_or_default();
+
+        let mut guard = self.resolved_servers.write().await;
+        if !resolved.is_empty() {
+            if guard.urls != resolved {
+                tracing::info!(
+                    "Resolved coordinator servers via _sshcast DNS TXT: {}",
+                    resolved.join(", ")
+                );
+            }
+            guard.urls = resolved.clone();
+            guard.resolved_at = Some(Instant::now());
+            return resolved;
+        }
+        guard.urls.clone()
+    }
+
+    async fn get_or_connect_channel(&self, url: &str) -> Result<Channel> {
         {
             let guard = self.channels.read().await;
-            if let Some(Some(ch)) = guard.get(idx) {
+            if let Some(ch) = guard.get(url) {
                 return Ok(ch.clone());
             }
         }
@@ -89,13 +150,12 @@ impl CoordinatorClient {
         let _conn_guard = self.connect_lock.lock().await;
         {
             let guard = self.channels.read().await;
-            if let Some(Some(ch)) = guard.get(idx) {
+            if let Some(ch) = guard.get(url) {
                 return Ok(ch.clone());
             }
         }
 
-        let url = &self.cfg.servers[idx];
-        let mut endpoint = Endpoint::from_shared(url.clone())
+        let mut endpoint = Endpoint::from_shared(url.to_string())
             .with_context(|| format!("invalid server endpoint URL {url}"))?
             .connect_timeout(Duration::from_millis(self.cfg.connect_timeout_ms))
             .tcp_keepalive(Some(Duration::from_secs(30)))
@@ -130,19 +190,15 @@ impl CoordinatorClient {
 
         {
             let mut guard = self.channels.write().await;
-            if let Some(slot) = guard.get_mut(idx) {
-                *slot = Some(channel.clone());
-            }
+            guard.insert(url.to_string(), channel.clone());
         }
 
         Ok(channel)
     }
 
-    async fn invalidate_channel(&self, idx: usize) {
+    async fn invalidate_channel(&self, url: &str) {
         let mut guard = self.channels.write().await;
-        if let Some(slot) = guard.get_mut(idx) {
-            *slot = None;
-        }
+        guard.remove(url);
     }
 
     /// Returns cached public keys immediately (0ms) using stale-while-revalidate when cached keys
@@ -234,13 +290,18 @@ impl CoordinatorClient {
     }
 
     async fn fetch_identities_remote(&self) -> Result<Vec<PublicKey>> {
-        let num_servers = self.cfg.servers.len();
+        let servers = self.get_active_server_urls().await;
+        if servers.is_empty() {
+            anyhow::bail!("no coordinator servers resolved from configuration");
+        }
+        let num_servers = servers.len();
         let start = self.preferred_idx.load(Ordering::Relaxed) % num_servers;
         let mut last_err = None;
 
         for offset in 0..num_servers {
             let idx = (start + offset) % num_servers;
-            let ch = match self.get_or_connect_channel(idx).await {
+            let url = &servers[idx];
+            let ch = match self.get_or_connect_channel(url).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_err = Some(e);
@@ -269,10 +330,10 @@ impl CoordinatorClient {
                     }
                 }
                 Err(status) => {
-                    self.invalidate_channel(idx).await;
+                    self.invalidate_channel(url).await;
                     last_err = Some(anyhow::anyhow!(
                         "GetIdentities on {} failed: {}",
-                        self.cfg.servers[idx],
+                        url,
                         status
                     ));
                 }
@@ -317,13 +378,18 @@ impl CoordinatorClient {
         sign_sign_request(&mut sign_req, &self.cfg.node_signing_key)
             .context("failed to sign SignRequest with relay Ed25519 key")?;
 
-        let num_servers = self.cfg.servers.len();
+        let servers = self.get_active_server_urls().await;
+        if servers.is_empty() {
+            anyhow::bail!("no coordinator servers resolved from configuration");
+        }
+        let num_servers = servers.len();
         let start = self.preferred_idx.load(Ordering::Relaxed) % num_servers;
         let mut last_err = None;
 
         for offset in 0..num_servers {
             let idx = (start + offset) % num_servers;
-            let ch = match self.get_or_connect_channel(idx).await {
+            let url = &servers[idx];
+            let ch = match self.get_or_connect_channel(url).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_err = Some(e);
@@ -339,7 +405,7 @@ impl CoordinatorClient {
             tracing::info!(
                 "Dispatching SignRequest {} to {}",
                 sign_req.request_id,
-                self.cfg.servers[idx]
+                url
             );
             match client.sign(rpc_req).await {
                 Ok(resp) => {
@@ -347,7 +413,7 @@ impl CoordinatorClient {
                     tracing::info!(
                         "SignRequest {} returned from {} in {}ms (approved={}, handled_by={})",
                         sign_req.request_id,
-                        self.cfg.servers[idx],
+                        url,
                         t_sign.elapsed().as_millis(),
                         inner.approved,
                         inner.handled_by_node_id
@@ -366,15 +432,15 @@ impl CoordinatorClient {
                     // Otherwise (e.g., no workstation connected to this coordinator), try next server if any.
                     last_err = Some(anyhow::anyhow!(
                         "coordinator {} could not route sign request: {}",
-                        self.cfg.servers[idx],
+                        url,
                         inner.error_message
                     ));
                 }
                 Err(status) => {
-                    self.invalidate_channel(idx).await;
+                    self.invalidate_channel(url).await;
                     last_err = Some(anyhow::anyhow!(
                         "Sign RPC on {} failed: {}",
-                        self.cfg.servers[idx],
+                        url,
                         status
                     ));
                 }
