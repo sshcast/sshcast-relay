@@ -1,4 +1,4 @@
-use sockcast_proto::v1::{ProcessAncestor, ProcessContext};
+use sshcast_proto::v1::{ProcessAncestor, ProcessContext};
 use std::path::Path;
 use tokio::net::UnixStream;
 

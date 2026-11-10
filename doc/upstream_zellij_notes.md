@@ -1,6 +1,6 @@
 # Upstream Zellij PR Notes
 
-This document records two upstream Zellij issues discovered while integrating `zellij web` with `sockcast-relay`, along with exact file/line locations and proposed fixes for submitting upstream pull requests.
+This document records two upstream Zellij issues discovered while integrating `zellij web` with `sshcast-relay`, along with exact file/line locations and proposed fixes for submitting upstream pull requests.
 
 ---
 

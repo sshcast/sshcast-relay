@@ -1,0 +1,16 @@
+[Unit]
+Description=Sshcast Roaming SSH Agent Relay Daemon
+Documentation=https://github.com/theraphim/sshcast-relay
+Requires=sshcast-relay.socket
+After=sshcast-relay.socket network-online.target
+
+[Service]
+Type=simple
+Environment=TERM=xterm-256color
+ExecStart=/usr/bin/sshcast-relay run
+Restart=no
+NoNewPrivileges=yes
+KillMode=process
+
+[Install]
+Also=sshcast-relay.socket

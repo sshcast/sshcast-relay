@@ -3,10 +3,10 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use sockcast_proto::crypto::{create_node_auth, sign_sign_request};
-use sockcast_proto::ssh::parse_ssh_auth_context;
-use sockcast_proto::v1::sockcast_service_client::SockcastServiceClient;
-use sockcast_proto::v1::{
+use sshcast_proto::crypto::{create_node_auth, sign_sign_request};
+use sshcast_proto::ssh::parse_ssh_auth_context;
+use sshcast_proto::v1::sshcast_service_client::SshcastServiceClient;
+use sshcast_proto::v1::{
     GetIdentitiesRequest, ProcessContext, PublicKey, SignRequest, SignResponse,
 };
 use std::path::Path;
@@ -254,7 +254,7 @@ impl CoordinatorClient {
                 Self::now_unix_ms(),
             )?;
 
-            let mut client = SockcastServiceClient::new(ch);
+            let mut client = SshcastServiceClient::new(ch);
             let mut req = tonic::Request::new(GetIdentitiesRequest { auth: Some(auth) });
             req.set_timeout(Duration::from_millis(self.cfg.connect_timeout_ms.max(3000)));
 
@@ -283,7 +283,7 @@ impl CoordinatorClient {
     }
 
     /// Packages, cryptographically signs end-to-end with the relay's Ed25519 private key,
-    /// and dispatches a `SignRequest` to configured `sockcast-server` endpoints with failover.
+    /// and dispatches a `SignRequest` to configured `sshcast-server` endpoints with failover.
     pub async fn sign_challenge(
         &self,
         key_blob: Vec<u8>,
@@ -331,7 +331,7 @@ impl CoordinatorClient {
                 }
             };
 
-            let mut client = SockcastServiceClient::new(ch);
+            let mut client = SshcastServiceClient::new(ch);
             let mut rpc_req = tonic::Request::new(sign_req.clone());
             rpc_req.set_timeout(Duration::from_secs(self.cfg.sign_timeout_secs));
 

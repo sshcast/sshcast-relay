@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
-use sockcast_proto::bundle::EnrollmentBundle;
-use sockcast_proto::crypto::verify_node_grant;
-use sockcast_proto::v1::NodeRole;
+use sshcast_proto::bundle::EnrollmentBundle;
+use sshcast_proto::crypto::verify_node_grant;
+use sshcast_proto::v1::NodeRole;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -10,12 +10,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::config::{default_config_path, home_dir, RelayConfigFile};
 
 pub const SYSTEMD_SOCKET_UNIT: &str = r#"[Unit]
-Description=Sockcast Roaming SSH Agent Relay Socket
-Documentation=https://github.com/theraphim/sockcast-relay
+Description=Sshcast Roaming SSH Agent Relay Socket
+Documentation=https://github.com/theraphim/sshcast-relay
 
 [Socket]
-ListenStream=%t/sockcast.sock
-FileDescriptorName=sockcast.sock
+ListenStream=%t/sshcast.sock
+FileDescriptorName=sshcast.sock
 SocketMode=0600
 DirectoryMode=0700
 
@@ -26,10 +26,10 @@ WantedBy=sockets.target
 pub fn render_systemd_service_unit(binary_path: &str) -> String {
     format!(
         r#"[Unit]
-Description=Sockcast Roaming SSH Agent Relay Daemon
-Documentation=https://github.com/theraphim/sockcast-relay
-Requires=sockcast-relay.socket
-After=sockcast-relay.socket network-online.target
+Description=Sshcast Roaming SSH Agent Relay Daemon
+Documentation=https://github.com/theraphim/sshcast-relay
+Requires=sshcast-relay.socket
+After=sshcast-relay.socket network-online.target
 
 [Service]
 Type=simple
@@ -40,7 +40,7 @@ NoNewPrivileges=yes
 KillMode=process
 
 [Install]
-Also=sockcast-relay.socket
+Also=sshcast-relay.socket
 "#
     )
 }
@@ -48,8 +48,8 @@ Also=sockcast-relay.socket
 pub fn render_systemd_zellij_web_service_unit(port: u16) -> String {
     format!(
         r#"[Unit]
-Description=Sockcast Zellij Web Local Server
-Documentation=https://github.com/theraphim/sockcast-relay
+Description=Sshcast Zellij Web Local Server
+Documentation=https://github.com/theraphim/sshcast-relay
 After=network.target
 
 [Service]
@@ -139,8 +139,8 @@ pub fn run_init(opts: &InitOptions) -> Result<InitOutcome> {
     std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("failed to set 0600 permissions on {}", cfg_path.display()))?;
 
-    let global_socket = opts.global_systemd_user_dir.join("sockcast-relay.socket");
-    let global_service = opts.global_systemd_user_dir.join("sockcast-relay.service");
+    let global_socket = opts.global_systemd_user_dir.join("sshcast-relay.socket");
+    let global_service = opts.global_systemd_user_dir.join("sshcast-relay.service");
 
     let mut installed_local_units = false;
     let mut socket_unit_path = None;
@@ -158,9 +158,9 @@ pub fn run_init(opts: &InitOptions) -> Result<InitOutcome> {
             )
         })?;
 
-        let sock_path = user_systemd_dir.join("sockcast-relay.socket");
-        let svc_path = user_systemd_dir.join("sockcast-relay.service");
-        let zellij_svc_path = user_systemd_dir.join("sockcast-zellij-web.service");
+        let sock_path = user_systemd_dir.join("sshcast-relay.socket");
+        let svc_path = user_systemd_dir.join("sshcast-relay.service");
+        let zellij_svc_path = user_systemd_dir.join("sshcast-zellij-web.service");
 
         let bin_path = resolve_binary_path();
         std::fs::write(&sock_path, SYSTEMD_SOCKET_UNIT)
@@ -186,15 +186,15 @@ pub fn run_init(opts: &InitOptions) -> Result<InitOutcome> {
             .args(["--user", "daemon-reload"])
             .status();
         let status = Command::new("systemctl")
-            .args(["--user", "enable", "--now", "sockcast-relay.socket"])
+            .args(["--user", "enable", "--now", "sshcast-relay.socket"])
             .status();
         match status {
             Ok(s) if s.success() => {
-                tracing::info!("Enabled and started systemd user unit: sockcast-relay.socket");
+                tracing::info!("Enabled and started systemd user unit: sshcast-relay.socket");
             }
             Ok(s) => {
                 tracing::warn!(
-                    "systemctl --user enable --now sockcast-relay.socket exited with {}",
+                    "systemctl --user enable --now sshcast-relay.socket exited with {}",
                     s
                 );
             }
@@ -204,10 +204,10 @@ pub fn run_init(opts: &InitOptions) -> Result<InitOutcome> {
         }
         if opts.enable_zellij {
             let _ = Command::new("systemctl")
-                .args(["--user", "enable", "--now", "sockcast-zellij-web.service"])
+                .args(["--user", "enable", "--now", "sshcast-zellij-web.service"])
                 .status();
             let _ = Command::new("systemctl")
-                .args(["--user", "start", "sockcast-relay.service"])
+                .args(["--user", "start", "sshcast-relay.service"])
                 .status();
         }
         check_systemd_linger();
@@ -234,13 +234,13 @@ fn default_systemd_user_dir() -> Result<PathBuf> {
 }
 
 fn resolve_binary_path() -> String {
-    if Path::new("/usr/bin/sockcast-relay").exists() {
-        return "/usr/bin/sockcast-relay".to_string();
+    if Path::new("/usr/bin/sshcast-relay").exists() {
+        return "/usr/bin/sshcast-relay".to_string();
     }
     std::env::current_exe()
         .ok()
         .and_then(|p| p.into_os_string().into_string().ok())
-        .unwrap_or_else(|| "/usr/bin/sockcast-relay".to_string())
+        .unwrap_or_else(|| "/usr/bin/sshcast-relay".to_string())
 }
 
 fn check_systemd_linger() {
@@ -252,7 +252,7 @@ fn check_systemd_linger() {
     if !linger_file.exists() {
         eprintln!(
             "Note: systemd user linger is not enabled for user '{user}'.\n\
-             To keep sockcast-relay.socket active inside detached Zellij/tmux sessions after SSH logout, run:\n\
+             To keep sshcast-relay.socket active inside detached Zellij/tmux sessions after SSH logout, run:\n\
              sudo loginctl enable-linger {user}"
         );
     }

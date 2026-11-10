@@ -1,18 +1,18 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use sockcast_relay::config::RelayConfig;
-use sockcast_relay::init::{run_init, InitOptions};
-use sockcast_relay::listener::run_daemon;
-use sockcast_relay::zellij::{discover_zellij_sessions, ensure_zellij_web_sharing_enabled};
+use sshcast_relay::config::RelayConfig;
+use sshcast_relay::init::{run_init, InitOptions};
+use sshcast_relay::listener::run_daemon;
+use sshcast_relay::zellij::{discover_zellij_sessions, ensure_zellij_web_sharing_enabled};
 use std::path::PathBuf;
 use std::process::Command;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "sockcast-relay",
+    name = "sshcast-relay",
     version,
-    about = "Sockcast Roaming SSH Agent Target Host Relay"
+    about = "Sshcast Roaming SSH Agent Target Host Relay"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -21,17 +21,17 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Enroll this Linux host using a Base64 enrollment bundle from `sockcast-client grant-relay`
+    /// Enroll this Linux host using a Base64 enrollment bundle from `sshcast-client grant-relay`
     Init {
         /// Compact enrollment bundle token (`sc1_<base64>`)
         #[arg(long)]
         bundle: String,
 
-        /// Optional custom path for `relay.toml` (defaults to `~/.config/sockcast/relay.toml`)
+        /// Optional custom path for `relay.toml` (defaults to `~/.config/sshcast/relay.toml`)
         #[arg(long)]
         config: Option<PathBuf>,
 
-        /// Skip running `systemctl --user enable --now sockcast-relay.socket`
+        /// Skip running `systemctl --user enable --now sshcast-relay.socket`
         #[arg(long, default_value_t = false)]
         no_systemctl: bool,
 
@@ -41,7 +41,7 @@ enum Commands {
     },
     /// Run the SSH agent relay daemon (invoked via `systemd --user` socket activation or standalone)
     Run {
-        /// Optional custom path for `relay.toml` (defaults to `~/.config/sockcast/relay.toml`)
+        /// Optional custom path for `relay.toml` (defaults to `~/.config/sshcast/relay.toml`)
         #[arg(long)]
         config: Option<PathBuf>,
 
@@ -116,7 +116,7 @@ async fn main() -> Result<()> {
             };
             let outcome = run_init(&opts)?;
             println!(
-                "Enrolled sockcast-relay node '{}' for user '{}'",
+                "Enrolled sshcast-relay node '{}' for user '{}'",
                 outcome.node_id, outcome.user_id
             );
             println!("  Config written to: {}", outcome.config_path.display());
@@ -133,7 +133,7 @@ async fn main() -> Result<()> {
                 println!("  Using global RPM systemd user units in /usr/lib/systemd/user/");
             }
             println!(
-                "\nEnsure your shell profile exports:\n  bash/zsh: export SSH_AUTH_SOCK=\"$XDG_RUNTIME_DIR/sockcast.sock\"\n  fish:     set -gx SSH_AUTH_SOCK \"$XDG_RUNTIME_DIR/sockcast.sock\""
+                "\nEnsure your shell profile exports:\n  bash/zsh: export SSH_AUTH_SOCK=\"$XDG_RUNTIME_DIR/sshcast.sock\"\n  fish:     set -gx SSH_AUTH_SOCK \"$XDG_RUNTIME_DIR/sshcast.sock\""
             );
             Ok(())
         }
@@ -166,11 +166,11 @@ async fn main() -> Result<()> {
                     .status();
                 if port.unwrap_or(8082) == 8082 {
                     let _ = Command::new("systemctl")
-                        .args(["--user", "enable", "--now", "sockcast-zellij-web.service"])
+                        .args(["--user", "enable", "--now", "sshcast-zellij-web.service"])
                         .status();
                 }
                 let _ = Command::new("systemctl")
-                    .args(["--user", "restart", "sockcast-relay.service"])
+                    .args(["--user", "restart", "sshcast-relay.service"])
                     .status();
                 Ok(())
             }
@@ -178,10 +178,10 @@ async fn main() -> Result<()> {
                 let path = RelayConfig::set_zellij_config(config.as_deref(), false, None)?;
                 println!("Disabled Zellij Web tunneling in {}", path.display());
                 let _ = Command::new("systemctl")
-                    .args(["--user", "disable", "--now", "sockcast-zellij-web.service"])
+                    .args(["--user", "disable", "--now", "sshcast-zellij-web.service"])
                     .status();
                 let _ = Command::new("systemctl")
-                    .args(["--user", "restart", "sockcast-relay.service"])
+                    .args(["--user", "restart", "sshcast-relay.service"])
                     .status();
                 Ok(())
             }

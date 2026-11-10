@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use sockcast_proto::v1::{ProcessContext, PublicKey};
+use sshcast_proto::v1::{ProcessContext, PublicKey};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 

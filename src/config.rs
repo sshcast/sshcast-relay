@@ -4,8 +4,8 @@ use base64::Engine;
 use ed25519_dalek::SigningKey;
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use sockcast_proto::bundle::EnrollmentBundle;
-use sockcast_proto::v1::NodeGrant;
+use sshcast_proto::bundle::EnrollmentBundle;
+use sshcast_proto::v1::NodeGrant;
 use std::path::{Path, PathBuf};
 
 fn default_idle_timeout_secs() -> u64 {
@@ -29,7 +29,7 @@ pub fn default_zellij_web_port() -> u16 {
 }
 
 pub fn default_stun_servers() -> Vec<String> {
-    sockcast_proto::p2p::DEFAULT_STUN_SERVERS
+    sshcast_proto::p2p::DEFAULT_STUN_SERVERS
         .iter()
         .map(|s| (*s).to_string())
         .collect()
@@ -37,13 +37,13 @@ pub fn default_stun_servers() -> Vec<String> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayConfigFile {
-    /// Coordinator server URLs (e.g. ["https://sockcast.example.com", "http://127.0.0.1:50051"])
+    /// Coordinator server URLs (e.g. ["https://sshcast.example.com", "http://127.0.0.1:50051"])
     pub servers: Vec<String>,
     /// Base64 URL-safe encoded 32-byte Ed25519 private key seed for this relay node.
     pub node_privkey_seed_b64: String,
     /// Base64 URL-safe encoded protobuf `NodeGrant` signed by the user's root key.
     pub grant_proto_b64: String,
-    /// Optional Unix socket path override (defaults to `/run/user/$UID/sockcast.sock`).
+    /// Optional Unix socket path override (defaults to `/run/user/$UID/sshcast.sock`).
     #[serde(default)]
     pub socket_path: Option<String>,
     /// Idle timeout in seconds before auto-exiting when no connections are active (default: 900s = 15m; 0 = never exit).
@@ -52,7 +52,7 @@ pub struct RelayConfigFile {
     /// In-memory public key cache TTL in seconds (default: 60s).
     #[serde(default = "default_key_cache_ttl_secs")]
     pub key_cache_ttl_secs: u64,
-    /// Optional disk cache path for public keys (defaults to `~/.cache/sockcast/pubkeys.json`).
+    /// Optional disk cache path for public keys (defaults to `~/.cache/sshcast/pubkeys.json`).
     #[serde(default)]
     pub pubkey_cache_path: Option<String>,
     /// Per-server gRPC connect timeout in milliseconds (default: 3000ms).
@@ -223,10 +223,10 @@ pub fn home_dir() -> Result<PathBuf> {
 pub fn default_config_dir() -> Result<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
         if !xdg.is_empty() {
-            return Ok(PathBuf::from(xdg).join("sockcast"));
+            return Ok(PathBuf::from(xdg).join("sshcast"));
         }
     }
-    Ok(home_dir()?.join(".config").join("sockcast"))
+    Ok(home_dir()?.join(".config").join("sshcast"))
 }
 
 pub fn default_config_path() -> Result<PathBuf> {
@@ -236,13 +236,13 @@ pub fn default_config_path() -> Result<PathBuf> {
 pub fn default_cache_dir() -> PathBuf {
     if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
         if !xdg.is_empty() {
-            return PathBuf::from(xdg).join("sockcast");
+            return PathBuf::from(xdg).join("sshcast");
         }
     }
     if let Ok(home) = home_dir() {
-        return home.join(".cache").join("sockcast");
+        return home.join(".cache").join("sshcast");
     }
-    PathBuf::from(format!("/tmp/sockcast-cache-{}", current_euid()))
+    PathBuf::from(format!("/tmp/sshcast-cache-{}", current_euid()))
 }
 
 pub fn default_pubkey_cache_path() -> PathBuf {
@@ -252,8 +252,8 @@ pub fn default_pubkey_cache_path() -> PathBuf {
 pub fn default_socket_path() -> PathBuf {
     if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
         if !runtime_dir.is_empty() {
-            return PathBuf::from(runtime_dir).join("sockcast.sock");
+            return PathBuf::from(runtime_dir).join("sshcast.sock");
         }
     }
-    PathBuf::from(format!("/run/user/{}/sockcast.sock", current_euid()))
+    PathBuf::from(format!("/run/user/{}/sshcast.sock", current_euid()))
 }

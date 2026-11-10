@@ -124,7 +124,7 @@ pub async fn serve_with_listener(
         tokio::select! {
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
-                    tracing::info!("Shutdown signal received; stopping sockcast-relay listener");
+                    tracing::info!("Shutdown signal received; stopping sshcast-relay listener");
                     return Ok(());
                 }
             }
@@ -185,13 +185,13 @@ pub async fn serve_with_listener(
     }
 }
 
-/// Top-level entry point for `sockcast-relay run`: uses `systemd` socket activation if available,
+/// Top-level entry point for `sshcast-relay run`: uses `systemd` socket activation if available,
 /// or binds `cfg.socket_path` directly.
 pub async fn run_daemon(cfg: RelayConfig) -> Result<()> {
     let (listener, is_socket_activated) = match take_systemd_socket()? {
         Some(l) => {
             tracing::info!(
-                "Started sockcast-relay via systemd socket activation (node_id={}, idle_timeout={}s)",
+                "Started sshcast-relay via systemd socket activation (node_id={}, idle_timeout={}s)",
                 cfg.grant.node_id,
                 cfg.idle_timeout_secs
             );
@@ -200,7 +200,7 @@ pub async fn run_daemon(cfg: RelayConfig) -> Result<()> {
         None => {
             let l = bind_standalone_socket(&cfg.socket_path)?;
             tracing::info!(
-                "Started sockcast-relay listening on {} (node_id={}, idle_timeout={}s)",
+                "Started sshcast-relay listening on {} (node_id={}, idle_timeout={}s)",
                 cfg.socket_path.display(),
                 cfg.grant.node_id,
                 cfg.idle_timeout_secs

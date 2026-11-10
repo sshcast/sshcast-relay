@@ -1,28 +1,28 @@
 use ed25519_dalek::SigningKey;
-use sockcast_proto::bundle::EnrollmentBundle;
-use sockcast_proto::crypto::{sign_node_grant, verify_node_auth, verify_sign_request, DEFAULT_MAX_CLOCK_SKEW_MS};
-use sockcast_proto::v1::sockcast_service_server::{SockcastService, SockcastServiceServer};
-use sockcast_proto::v1::{
+use sshcast_proto::bundle::EnrollmentBundle;
+use sshcast_proto::crypto::{sign_node_grant, verify_node_auth, verify_sign_request, DEFAULT_MAX_CLOCK_SKEW_MS};
+use sshcast_proto::v1::sshcast_service_server::{SshcastService, SshcastServiceServer};
+use sshcast_proto::v1::{
     ClientStreamMessage, GetIdentitiesRequest, GetIdentitiesResponse, NodeGrant, NodeRole,
     PublicKey, RelayStreamMessage, ServerStreamMessage, ServerToRelayMessage, SignRequest,
     SignResponse,
 };
-use sockcast_relay::agent::{
+use sshcast_relay::agent::{
     read_agent_frame, write_agent_frame, SSH2_AGENTC_ADD_IDENTITY, SSH2_AGENTC_REMOVE_ALL_IDENTITIES,
     SSH2_AGENTC_REQUEST_IDENTITIES, SSH2_AGENTC_SIGN_REQUEST, SSH2_AGENT_IDENTITIES_ANSWER,
     SSH2_AGENT_SIGN_RESPONSE, SSH_AGENTC_LOCK, SSH_AGENT_FAILURE,
 };
-use sockcast_relay::config::RelayConfig;
-use sockcast_relay::init::{run_init, InitOptions};
-use sockcast_relay::listener::{bind_standalone_socket, serve_with_listener};
-use sockcast_relay::proc_inspector::{
+use sshcast_relay::config::RelayConfig;
+use sshcast_relay::init::{run_init, InitOptions};
+use sshcast_relay::listener::{bind_standalone_socket, serve_with_listener};
+use sshcast_relay::proc_inspector::{
     format_cmdline, inspect_process_context_in_proc, parse_proc_stat,
 };
-use sockcast_relay::zellij::{
+use sshcast_relay::zellij::{
     ensure_zellij_web_sharing_in_file, inject_set_cookie_into_http_response,
     parse_zellij_create_token_output, parse_zellij_list_sessions_output,
     rewrite_http_request_for_zellij_web, rewrite_websocket_normal_close_to_4001,
-    try_build_sockcast_asset_http_response,
+    try_build_sshcast_asset_http_response,
 };
 use std::os::unix::fs::PermissionsExt;
 use std::pin::Pin;
@@ -148,17 +148,17 @@ fn test_init_bundle_writes_config_and_conditional_systemd_units() {
     .unwrap();
 
     assert!(out1.installed_local_units);
-    assert!(user_systemd_1.join("sockcast-relay.socket").exists());
-    assert!(user_systemd_1.join("sockcast-relay.service").exists());
-    assert!(user_systemd_1.join("sockcast-zellij-web.service").exists());
+    assert!(user_systemd_1.join("sshcast-relay.socket").exists());
+    assert!(user_systemd_1.join("sshcast-relay.service").exists());
+    assert!(user_systemd_1.join("sshcast-zellij-web.service").exists());
 
     let relay_svc_unit =
-        std::fs::read_to_string(user_systemd_1.join("sockcast-relay.service")).unwrap();
+        std::fs::read_to_string(user_systemd_1.join("sshcast-relay.service")).unwrap();
     assert!(!relay_svc_unit.contains("PrivateTmp=yes"));
     assert!(relay_svc_unit.contains("KillMode=process"));
 
     let zellij_svc_unit =
-        std::fs::read_to_string(user_systemd_1.join("sockcast-zellij-web.service")).unwrap();
+        std::fs::read_to_string(user_systemd_1.join("sshcast-zellij-web.service")).unwrap();
     assert!(zellij_svc_unit.contains("KillMode=process"));
 
     let mode = std::fs::metadata(&cfg_path_1).unwrap().permissions().mode() & 0o777;
@@ -177,8 +177,8 @@ fn test_init_bundle_writes_config_and_conditional_systemd_units() {
     // Case 2: Global RPM units DO exist in /usr/lib/systemd/user -> does NOT write ~/.config/systemd/user units
     let fake_global_rpm = tmp.path().join("global-rpm");
     std::fs::create_dir_all(&fake_global_rpm).unwrap();
-    std::fs::write(fake_global_rpm.join("sockcast-relay.socket"), "[Socket]\n").unwrap();
-    std::fs::write(fake_global_rpm.join("sockcast-relay.service"), "[Service]\n").unwrap();
+    std::fs::write(fake_global_rpm.join("sshcast-relay.socket"), "[Socket]\n").unwrap();
+    std::fs::write(fake_global_rpm.join("sshcast-relay.service"), "[Service]\n").unwrap();
 
     let cfg_path_2 = tmp.path().join("cfg2").join("relay.toml");
     let user_systemd_2 = tmp.path().join("systemd-user-2");
@@ -203,7 +203,7 @@ struct MockCoordinator {
 }
 
 #[tonic::async_trait]
-impl SockcastService for MockCoordinator {
+impl SshcastService for MockCoordinator {
     async fn get_identities(
         &self,
         request: Request<GetIdentitiesRequest>,
@@ -306,12 +306,12 @@ async fn test_end_to_end_agent_session_failover_and_idle_timeout() {
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(tcp_listener);
     tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
-            .add_service(SockcastServiceServer::new(mock_svc))
+            .add_service(SshcastServiceServer::new(mock_svc))
             .serve_with_incoming(incoming)
             .await;
     });
 
-    let sock_path = tmp.path().join("sockcast.sock");
+    let sock_path = tmp.path().join("sshcast.sock");
     let pubkey_cache_path = tmp.path().join("pubkeys.json");
 
     // Configure relay with a dead first coordinator URL (to verify automatic failover to server 2)
@@ -459,30 +459,30 @@ build-rpm [Created 1d ago] (EXITED - attach to resurrect)
     let index_resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 88\r\n\r\n<html><body><script type=\"module\" src=\"assets/app.js\"></script></body></html>";
     let index_injected = inject_set_cookie_into_http_response(index_resp, None);
     let index_str = String::from_utf8(index_injected).unwrap();
-    assert!(index_str.contains("/__sockcast/sockcast-fonts.css"));
-    assert!(index_str.contains("/__sockcast/sockcast-zellij.js"));
+    assert!(index_str.contains("/__sshcast/sshcast-fonts.css"));
+    assert!(index_str.contains("/__sshcast/sshcast-zellij.js"));
 
-    let css_req = b"GET /__sockcast/sockcast-fonts.css HTTP/1.1\r\nHost: 127.0.0.1:8082\r\n\r\n";
-    let css_resp = String::from_utf8(try_build_sockcast_asset_http_response(css_req).unwrap()).unwrap();
+    let css_req = b"GET /__sshcast/sshcast-fonts.css HTTP/1.1\r\nHost: 127.0.0.1:8082\r\n\r\n";
+    let css_resp = String::from_utf8(try_build_sshcast_asset_http_response(css_req).unwrap()).unwrap();
     assert!(css_resp.starts_with("HTTP/1.1 200 OK\r\nContent-Type: text/css"));
     assert!(css_resp.contains("Symbols Nerd Font Mono"));
     assert!(css_resp.contains("Iosevka Term"));
 
-    let js_req = b"GET /__sockcast/sockcast-zellij.js HTTP/1.1\r\nHost: 127.0.0.1:8082\r\n\r\n";
-    let js_resp = String::from_utf8(try_build_sockcast_asset_http_response(js_req).unwrap()).unwrap();
+    let js_req = b"GET /__sshcast/sshcast-zellij.js HTTP/1.1\r\nHost: 127.0.0.1:8082\r\n\r\n";
+    let js_resp = String::from_utf8(try_build_sshcast_asset_http_response(js_req).unwrap()).unwrap();
     assert!(js_resp.starts_with("HTTP/1.1 200 OK\r\nContent-Type: application/javascript"));
-    assert!(js_resp.contains("withSockcastNerdFonts"));
+    assert!(js_resp.contains("withSshcastNerdFonts"));
 
-    let font_gz_req = b"GET /__sockcast/SymbolsNerdFontMono-Regular.ttf HTTP/1.1\r\nHost: 127.0.0.1:8082\r\nAccept-Encoding: gzip, deflate\r\n\r\n";
-    let font_gz_resp = try_build_sockcast_asset_http_response(font_gz_req).unwrap();
+    let font_gz_req = b"GET /__sshcast/SymbolsNerdFontMono-Regular.ttf HTTP/1.1\r\nHost: 127.0.0.1:8082\r\nAccept-Encoding: gzip, deflate\r\n\r\n";
+    let font_gz_resp = try_build_sshcast_asset_http_response(font_gz_req).unwrap();
     let gz_hdr_end = font_gz_resp.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
     let gz_hdr_str = std::str::from_utf8(&font_gz_resp[..gz_hdr_end]).unwrap();
     assert!(gz_hdr_str.contains("Content-Type: font/ttf\r\n"));
     assert!(gz_hdr_str.contains("Content-Encoding: gzip\r\n"));
     assert_eq!(&font_gz_resp[gz_hdr_end + 4..gz_hdr_end + 6], &[0x1f, 0x8b]);
 
-    let font_raw_req = b"GET /__sockcast/IosevkaTerm-Regular.ttf HTTP/1.1\r\nHost: 127.0.0.1:8082\r\n\r\n";
-    let font_raw_resp = try_build_sockcast_asset_http_response(font_raw_req).unwrap();
+    let font_raw_req = b"GET /__sshcast/IosevkaTerm-Regular.ttf HTTP/1.1\r\nHost: 127.0.0.1:8082\r\n\r\n";
+    let font_raw_resp = try_build_sshcast_asset_http_response(font_raw_req).unwrap();
     let raw_hdr_end = font_raw_resp.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
     let raw_hdr_str = std::str::from_utf8(&font_raw_resp[..raw_hdr_end]).unwrap();
     assert!(raw_hdr_str.contains("Content-Type: font/ttf\r\n"));

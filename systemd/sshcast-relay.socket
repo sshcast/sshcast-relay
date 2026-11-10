@@ -1,0 +1,12 @@
+[Unit]
+Description=Sshcast Roaming SSH Agent Relay Socket
+Documentation=https://github.com/theraphim/sshcast-relay
+
+[Socket]
+ListenStream=%t/sshcast.sock
+FileDescriptorName=sshcast.sock
+SocketMode=0600
+DirectoryMode=0700
+
+[Install]
+WantedBy=sockets.target
