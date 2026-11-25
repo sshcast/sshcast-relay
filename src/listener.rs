@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::io::FromRawFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -67,14 +67,58 @@ pub fn take_systemd_socket() -> Result<Option<UnixListener>> {
 }
 
 /// Binds a standalone `UnixListener` at `socket_path` with `0600` permissions.
+/// Refuses to unlink an active Unix socket or non-socket filesystem entry.
 pub fn bind_standalone_socket(socket_path: &Path) -> Result<UnixListener> {
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent).with_context(|| {
             format!("failed to create parent directory {}", parent.display())
         })?;
     }
-    if socket_path.exists() {
-        let _ = std::fs::remove_file(socket_path);
+    match std::fs::symlink_metadata(socket_path) {
+        Ok(meta) => {
+            if !meta.file_type().is_socket() {
+                anyhow::bail!(
+                    "refusing to remove non-socket file at {}",
+                    socket_path.display()
+                );
+            }
+            match std::os::unix::net::UnixStream::connect(socket_path) {
+                Ok(_) => {
+                    anyhow::bail!(
+                        "Unix socket {} is already active (likely managed by sshcast-relay.socket or another sshcast-relay instance)",
+                        socket_path.display()
+                    );
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                    ) =>
+                {
+                    if let Err(rm_err) = std::fs::remove_file(socket_path) {
+                        if rm_err.kind() != std::io::ErrorKind::NotFound {
+                            return Err(rm_err).with_context(|| {
+                                format!("failed to remove stale socket {}", socket_path.display())
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!(
+                            "refusing to remove Unix socket {} after failed liveness probe",
+                            socket_path.display()
+                        )
+                    });
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!("failed to inspect existing path {}", socket_path.display())
+            });
+        }
     }
 
     let listener = UnixListener::bind(socket_path)

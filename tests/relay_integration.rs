@@ -512,3 +512,71 @@ build-rpm [Created 1d ago] (EXITED - attach to resurrect)
         "theme \"dracula\"\nweb_sharing \"on\"\n"
     );
 }
+
+#[tokio::test]
+async fn test_bind_standalone_socket_protects_active_and_non_socket_files() {
+    let tmp = TempDir::new().unwrap();
+
+    // 1. Active Unix socket must NOT be unlinked or replaced
+    let active_sock = tmp.path().join("sshcast.sock");
+    let original_listener = UnixListener::bind(&active_sock).unwrap();
+
+    let err = bind_standalone_socket(&active_sock).unwrap_err();
+    assert!(
+        err.to_string().contains("already active"),
+        "unexpected error for active socket: {err:#}"
+    );
+    assert!(active_sock.exists());
+    assert!(UnixStream::connect(&active_sock).await.is_ok());
+    drop(original_listener);
+
+    // 2. Stale Unix socket (no listener) should be cleaned up and rebound
+    let stale_sock = tmp.path().join("stale.sock");
+    {
+        let _stale = std::os::unix::net::UnixListener::bind(&stale_sock).unwrap();
+    }
+    assert!(stale_sock.exists());
+    let rebound = bind_standalone_socket(&stale_sock).expect("stale socket should be rebound");
+    assert!(UnixStream::connect(&stale_sock).await.is_ok());
+    drop(rebound);
+
+    // 3. Regular file must NOT be unlinked
+    let reg_file = tmp.path().join("not_a_socket");
+    std::fs::write(&reg_file, b"keep-me").unwrap();
+    let reg_err = bind_standalone_socket(&reg_file).unwrap_err();
+    assert!(
+        reg_err.to_string().contains("non-socket"),
+        "unexpected error for regular file: {reg_err:#}"
+    );
+    assert_eq!(std::fs::read(&reg_file).unwrap(), b"keep-me");
+}
+
+#[test]
+fn test_cli_requires_subcommand_and_preserves_existing_socket() {
+    let tmp = TempDir::new().unwrap();
+    let sock_path = tmp.path().join("sshcast.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sshcast-relay"))
+        .env("XDG_RUNTIME_DIR", tmp.path())
+        .env("XDG_CONFIG_HOME", tmp.path().join("config"))
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "bare sshcast-relay should exit non-zero without a subcommand"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Usage:"),
+        "expected usage text in stderr, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("run"),
+        "expected 'run' subcommand in stderr, got: {stderr}"
+    );
+    assert!(sock_path.exists());
+    assert!(std::os::unix::net::UnixStream::connect(&sock_path).is_ok());
+    drop(listener);
+}

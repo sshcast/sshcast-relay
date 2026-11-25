@@ -16,7 +16,7 @@ use tracing_subscriber::EnvFilter;
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Option<Commands>,
+    command: Commands,
 }
 
 #[derive(Debug, Subcommand)]
@@ -106,11 +106,7 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    match cli.command.unwrap_or(Commands::Run {
-        config: None,
-        socket: None,
-        idle_timeout_secs: None,
-    }) {
+    match cli.command {
         Commands::Init {
             bundle,
             config,
