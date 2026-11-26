@@ -1,23 +1,31 @@
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::Engine;
 use ed25519_dalek::SigningKey;
-use sshcast_proto::bundle::EnrollmentBundle;
-use sshcast_proto::crypto::{sign_node_grant, verify_node_auth, verify_sign_request, DEFAULT_MAX_CLOCK_SKEW_MS};
+use prost::Message as _;
+use sshcast_proto::bundle::{encode_user_cert_token, EnrollmentBundle};
+use sshcast_proto::crypto::{
+    derive_user_id, sign_node_grant, sign_user_cert, verify_node_auth, verify_sign_request,
+    DEFAULT_MAX_CLOCK_SKEW_MS,
+};
 use sshcast_proto::v1::sshcast_service_server::{SshcastService, SshcastServiceServer};
 use sshcast_proto::v1::{
-    ClientStreamMessage, GetIdentitiesRequest, GetIdentitiesResponse, NodeGrant, NodeRole,
-    PublicKey, RelayStreamMessage, ServerStreamMessage, ServerToRelayMessage, SignRequest,
-    SignResponse,
+    ClientStreamMessage, GetIdentitiesRequest, GetIdentitiesResponse, NodeAuth, NodeGrant,
+    NodeRole, ProcessContext, PublicKey, RelayStreamMessage, ServerStreamMessage,
+    ServerToRelayMessage, SignRequest, SignResponse, UserCert,
 };
 use sshcast_relay::agent::{
     read_agent_frame, write_agent_frame, SSH2_AGENTC_ADD_IDENTITY, SSH2_AGENTC_REMOVE_ALL_IDENTITIES,
     SSH2_AGENTC_REQUEST_IDENTITIES, SSH2_AGENTC_SIGN_REQUEST, SSH2_AGENT_IDENTITIES_ANSWER,
     SSH2_AGENT_SIGN_RESPONSE, SSH_AGENTC_LOCK, SSH_AGENT_FAILURE,
 };
-use sshcast_relay::config::RelayConfig;
+use sshcast_relay::client::CoordinatorClient;
+use sshcast_relay::config::{RelayConfig, RelayConfigFile};
 use sshcast_relay::init::{run_init, InitOptions};
 use sshcast_relay::listener::{bind_standalone_socket, serve_with_listener};
 use sshcast_relay::proc_inspector::{
     format_cmdline, inspect_process_context_in_proc, parse_proc_stat,
 };
+use sshcast_relay::renew::cert_needs_renewal;
 use sshcast_relay::zellij::{
     ensure_zellij_web_sharing_in_file, inject_set_cookie_into_http_response,
     parse_zellij_create_token_output, parse_zellij_list_sessions_output,
@@ -26,9 +34,11 @@ use sshcast_relay::zellij::{
 };
 use std::os::unix::fs::PermissionsExt;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
 use tonic::{Request, Response, Status, Streaming};
@@ -333,6 +343,8 @@ async fn test_end_to_end_agent_session_failover_and_idle_timeout() {
         zellij_enabled: false,
         zellij_web_port: 8082,
         stun_servers: Vec::new(),
+        operator_url: None,
+        config_path: None,
     };
 
     let unix_listener: UnixListener = bind_standalone_socket(&sock_path).unwrap();
@@ -579,4 +591,616 @@ fn test_cli_requires_subcommand_and_preserves_existing_socket() {
     assert!(sock_path.exists());
     assert!(std::os::unix::net::UnixStream::connect(&sock_path).is_ok());
     drop(listener);
+}
+
+#[derive(serde::Deserialize)]
+struct MockRenewReq {
+    node_auth_proto_b64: String,
+}
+
+async fn read_http_request(stream: &mut tokio::net::TcpStream) -> (String, Vec<u8>) {
+    let mut buf = Vec::with_capacity(4096);
+    let mut tmp = [0u8; 1024];
+    let header_end = loop {
+        let n = stream.read(&mut tmp).await.unwrap();
+        assert!(n > 0, "unexpected EOF reading HTTP request headers");
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos;
+        }
+    };
+    let header_str = std::str::from_utf8(&buf[..header_end]).unwrap().to_string();
+    let content_len = header_str
+        .lines()
+        .find_map(|line| {
+            let (k, v) = line.split_once(':')?;
+            if k.trim().eq_ignore_ascii_case("content-length") {
+                v.trim().parse::<usize>().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+    let body_start = header_end + 4;
+    while buf.len() < body_start + content_len {
+        let n = stream.read(&mut tmp).await.unwrap();
+        assert!(n > 0, "unexpected EOF reading HTTP request body");
+        buf.extend_from_slice(&tmp[..n]);
+    }
+    let body = buf[body_start..body_start + content_len].to_vec();
+    (header_str, body)
+}
+
+async fn spawn_mock_renew_server(
+    op_sk: SigningKey,
+    user_pk: Vec<u8>,
+    expected_relay_pk: Vec<u8>,
+    call_count: Arc<AtomicUsize>,
+    issued_certs: Arc<Mutex<Vec<UserCert>>>,
+) -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let op_sk = op_sk.clone();
+            let user_pk = user_pk.clone();
+            let expected_relay_pk = expected_relay_pk.clone();
+            let call_count = Arc::clone(&call_count);
+            let issued_certs = Arc::clone(&issued_certs);
+            tokio::spawn(async move {
+                let (headers, body) = read_http_request(&mut stream).await;
+                let first_line = headers.lines().next().unwrap_or("");
+                assert!(
+                    first_line.starts_with("POST /api/v1/renew "),
+                    "unexpected HTTP request line: {first_line}"
+                );
+
+                let req: MockRenewReq = serde_json::from_slice(&body).unwrap();
+                let raw_auth = URL_SAFE_NO_PAD
+                    .decode(req.node_auth_proto_b64.trim())
+                    .or_else(|_| STANDARD.decode(req.node_auth_proto_b64.trim()))
+                    .unwrap();
+                let auth = NodeAuth::decode(raw_auth.as_slice()).unwrap();
+                let grant = auth.grant.as_ref().expect("NodeAuth must include grant");
+
+                // Critical invariant: dormant relay must strip expired UserCert before signing NodeAuth
+                assert!(
+                    grant.user_cert.is_none(),
+                    "incoming NodeAuth grant.user_cert MUST be None on /api/v1/renew"
+                );
+                assert_eq!(grant.node_pubkey, expected_relay_pk);
+
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+                verify_node_auth(&auth, Some(NodeRole::Relay), now_ms, DEFAULT_MAX_CLOCK_SKEW_MS)
+                    .expect("NodeAuth from relay must pass verify_node_auth");
+
+                let seq = call_count.fetch_add(1, Ordering::SeqCst) as u64 + 1;
+                let now_sec = now_ms / 1000;
+                let mut new_cert = UserCert {
+                    user_id: derive_user_id(&user_pk),
+                    user_pubkey: user_pk,
+                    operator_pubkey: Vec::new(),
+                    issued_at_unix_sec: now_sec.saturating_sub(5),
+                    expires_at_unix_sec: now_sec + 7 * 86400 + seq,
+                    operator_signature: Vec::new(),
+                };
+                sign_user_cert(&mut new_cert, &op_sk);
+                issued_certs.lock().unwrap().push(new_cert.clone());
+
+                let token = encode_user_cert_token(&new_cert);
+                let resp_json = serde_json::json!({
+                    "ok": true,
+                    "cert_token": token,
+                })
+                .to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    resp_json.len(),
+                    resp_json
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    addr
+}
+
+#[test]
+fn test_cert_needs_renewal_matrix() {
+    let now = 1_750_000_000u64;
+    assert!(!cert_needs_renewal(None, now));
+
+    let make = |issued: u64, expires: u64| UserCert {
+        user_id: "sc_u_test".to_string(),
+        user_pubkey: vec![0x11; 32],
+        operator_pubkey: vec![0x22; 32],
+        issued_at_unix_sec: issued,
+        expires_at_unix_sec: expires,
+        operator_signature: vec![0x33; 64],
+    };
+
+    assert!(!cert_needs_renewal(Some(&make(now - 500, 0)), now));
+    assert!(!cert_needs_renewal(
+        Some(&make(now - 100, now - 100 + 7 * 86400)),
+        now
+    ));
+    assert!(cert_needs_renewal(
+        Some(&make(now - (7 * 86400) / 2, now + (7 * 86400) / 2)),
+        now
+    ));
+    assert!(!cert_needs_renewal(Some(&make(now - 10, now + 50)), now));
+    assert!(cert_needs_renewal(Some(&make(now - 35, now + 25)), now));
+    assert!(cert_needs_renewal(Some(&make(now - 100, now - 1)), now));
+}
+
+#[test]
+fn test_import_user_cert_persists_atomically_and_validates_pubkey() {
+    let tmp = TempDir::new().unwrap();
+    let op_sk = SigningKey::from_bytes(&[0x91; 32]);
+    let user_sk = SigningKey::from_bytes(&[0x11; 32]);
+    let other_user_sk = SigningKey::from_bytes(&[0x12; 32]);
+    let relay_sk = SigningKey::from_bytes(&[0x22; 32]);
+    let now_sec = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let mut grant = NodeGrant {
+        user_id: String::new(),
+        user_pubkey: Vec::new(),
+        node_id: "relay-atomic".to_string(),
+        role: NodeRole::Relay as i32,
+        node_pubkey: relay_sk.verifying_key().to_bytes().to_vec(),
+        issued_at_unix_sec: now_sec - 60,
+        expires_at_unix_sec: 0,
+        user_signature: Vec::new(),
+        user_cert: None,
+    };
+    sign_node_grant(&mut grant, &user_sk);
+
+    let bundle = EnrollmentBundle::new(
+        vec!["https://coord.example.com".to_string()],
+        relay_sk,
+        grant.clone(),
+    );
+    let cfg_path = tmp.path().join("relay.toml");
+    let file = RelayConfigFile::from_bundle(&bundle);
+    std::fs::write(&cfg_path, toml::to_string_pretty(&file).unwrap()).unwrap();
+
+    // Valid UserCert matching grant.user_pubkey
+    let mut cert = UserCert {
+        user_id: derive_user_id(&grant.user_pubkey),
+        user_pubkey: grant.user_pubkey.clone(),
+        operator_pubkey: Vec::new(),
+        issued_at_unix_sec: now_sec - 10,
+        expires_at_unix_sec: now_sec + 86400,
+        operator_signature: Vec::new(),
+    };
+    sign_user_cert(&mut cert, &op_sk);
+    let cert_token = encode_user_cert_token(&cert);
+
+    let (saved_path, saved_cert) =
+        RelayConfig::import_user_cert(Some(&cfg_path), &cert_token).unwrap();
+    assert_eq!(saved_path, cfg_path);
+    assert_eq!(saved_cert, cert);
+
+    let mode = std::fs::metadata(&cfg_path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    let reloaded = RelayConfig::load(Some(&cfg_path)).unwrap();
+    assert_eq!(reloaded.grant.user_cert, Some(cert));
+
+    // Mismatched UserCert user_pubkey must fail without modifying relay.toml
+    let wrong_pk = other_user_sk.verifying_key().to_bytes().to_vec();
+    let mut wrong_cert = UserCert {
+        user_id: derive_user_id(&wrong_pk),
+        user_pubkey: wrong_pk,
+        operator_pubkey: Vec::new(),
+        issued_at_unix_sec: now_sec - 10,
+        expires_at_unix_sec: now_sec + 86400,
+        operator_signature: Vec::new(),
+    };
+    sign_user_cert(&mut wrong_cert, &op_sk);
+    let wrong_token = encode_user_cert_token(&wrong_cert);
+    assert!(RelayConfig::import_user_cert(Some(&cfg_path), &wrong_token).is_err());
+}
+
+#[tokio::test]
+async fn test_proactive_user_cert_renewal_and_atomic_persistence() {
+    let tmp = TempDir::new().unwrap();
+    let op_sk = SigningKey::from_bytes(&[0x71; 32]);
+    let user_sk = SigningKey::from_bytes(&[0x72; 32]);
+    let relay_sk = SigningKey::from_bytes(&[0x73; 32]);
+    let user_pk = user_sk.verifying_key().to_bytes().to_vec();
+    let relay_pk = relay_sk.verifying_key().to_bytes().to_vec();
+
+    let now_sec = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // Start with an EXPIRED UserCert embedded in relay.toml
+    let mut expired_cert = UserCert {
+        user_id: derive_user_id(&user_pk),
+        user_pubkey: user_pk.clone(),
+        operator_pubkey: Vec::new(),
+        issued_at_unix_sec: now_sec - 1000,
+        expires_at_unix_sec: now_sec - 60,
+        operator_signature: Vec::new(),
+    };
+    sign_user_cert(&mut expired_cert, &op_sk);
+
+    let mut grant = NodeGrant {
+        user_id: String::new(),
+        user_pubkey: Vec::new(),
+        node_id: "relay-dormant.local".to_string(),
+        role: NodeRole::Relay as i32,
+        node_pubkey: relay_pk.clone(),
+        issued_at_unix_sec: now_sec - 1000,
+        expires_at_unix_sec: 0,
+        user_signature: Vec::new(),
+        user_cert: Some(expired_cert),
+    };
+    sign_node_grant(&mut grant, &user_sk);
+
+    // Start mock gRPC coordinator (enforces valid non-expired UserCert in NodeGrant)
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let mock_svc = MockCoordinator {
+        keys: vec![PublicKey {
+            key_blob: b"ssh-ed25519-renew-test".to_vec(),
+            comment: "renew@workstation".to_string(),
+            fingerprint_sha256: "SHA256:renewfp".to_string(),
+            key_type: "ssh-ed25519".to_string(),
+        }],
+        captured_sign_requests: Arc::clone(&captured),
+    };
+    let grpc_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let grpc_addr = grpc_listener.local_addr().unwrap();
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(grpc_listener);
+    tokio::spawn(async move {
+        let _ = tonic::transport::Server::builder()
+            .add_service(SshcastServiceServer::new(mock_svc))
+            .serve_with_incoming(incoming)
+            .await;
+    });
+
+    // Start mock HTTP /api/v1/renew operator server
+    let renew_calls = Arc::new(AtomicUsize::new(0));
+    let issued_certs = Arc::new(Mutex::new(Vec::new()));
+    let op_addr = spawn_mock_renew_server(
+        op_sk,
+        user_pk,
+        relay_pk,
+        Arc::clone(&renew_calls),
+        Arc::clone(&issued_certs),
+    )
+    .await;
+
+    // Write relay.toml on disk with operator_url and expired UserCert
+    let cfg_path = tmp.path().join("relay.toml");
+    let bundle = EnrollmentBundle::new(vec![format!("http://{}", grpc_addr)], relay_sk, grant);
+    let mut cfg_file = RelayConfigFile::from_bundle(&bundle);
+    cfg_file.operator_url = Some(format!("http://{}", op_addr));
+    cfg_file.pubkey_cache_path = Some(tmp.path().join("pubkeys.json").to_string_lossy().to_string());
+    std::fs::write(&cfg_path, toml::to_string_pretty(&cfg_file).unwrap()).unwrap();
+
+    let cfg = RelayConfig::load(Some(&cfg_path)).unwrap();
+    assert_eq!(cfg.config_path.as_deref(), Some(cfg_path.as_path()));
+    assert_eq!(
+        cfg.operator_url.as_deref(),
+        Some(format!("http://{}", op_addr).as_str())
+    );
+
+    let coord = Arc::new(CoordinatorClient::new(cfg));
+
+    // get_identities triggers proactive renewal before RPC, hot-swaps cert, persists to disk, and succeeds
+    let keys = coord.get_identities().await;
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].comment, "renew@workstation");
+    assert_eq!(renew_calls.load(Ordering::SeqCst), 1);
+
+    let expected_cert = issued_certs.lock().unwrap()[0].clone();
+    assert_eq!(coord.current_grant().await.user_cert, Some(expected_cert.clone()));
+
+    // Verify atomic persistence to relay.toml with 0600 perms and no stray temp files
+    let reloaded = RelayConfig::load(Some(&cfg_path)).unwrap();
+    assert_eq!(reloaded.grant.user_cert, Some(expected_cert.clone()));
+    let mode = std::fs::metadata(&cfg_path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    let leftover_tmp = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .any(|e| e.file_name().to_string_lossy().contains(".tmp."));
+    assert!(!leftover_tmp, "no leftover temp files should remain after atomic rename");
+
+    // Subsequent sign_challenge uses fresh in-memory cert without re-renewing
+    let sign_resp = coord
+        .sign_challenge(
+            b"ssh-ed25519-renew-test".to_vec(),
+            b"challenge-bytes".to_vec(),
+            0,
+            ProcessContext {
+                hostname: "relay-dormant.local".to_string(),
+                uid: 1000,
+                pid: 42,
+                comm: "ssh".to_string(),
+                cmdline: "ssh host".to_string(),
+                cwd: "/tmp".to_string(),
+                ancestors: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(sign_resp.approved);
+    assert_eq!(renew_calls.load(Ordering::SeqCst), 1);
+    let captured_reqs = captured.lock().unwrap();
+    assert_eq!(captured_reqs.len(), 1);
+    assert_eq!(
+        captured_reqs[0]
+            .relay_grant
+            .as_ref()
+            .and_then(|g| g.user_cert.clone()),
+        Some(expected_cert)
+    );
+}
+
+struct RejectStaleCertCoordinator {
+    rejected_certs: Arc<Mutex<Vec<UserCert>>>,
+}
+
+#[tonic::async_trait]
+impl SshcastService for RejectStaleCertCoordinator {
+    async fn get_identities(
+        &self,
+        request: Request<GetIdentitiesRequest>,
+    ) -> Result<Response<GetIdentitiesResponse>, Status> {
+        let auth = request
+            .into_inner()
+            .auth
+            .ok_or_else(|| Status::unauthenticated("missing auth"))?;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        verify_node_auth(&auth, Some(NodeRole::Relay), now_ms, DEFAULT_MAX_CLOCK_SKEW_MS)
+            .map_err(|e| Status::unauthenticated(e.to_string()))?;
+
+        let cert = auth
+            .grant
+            .and_then(|g| g.user_cert)
+            .ok_or_else(|| Status::unauthenticated("missing user_cert"))?;
+        if self.rejected_certs.lock().unwrap().contains(&cert) {
+            return Err(Status::unauthenticated("cert revoked by operator"));
+        }
+
+        Ok(Response::new(GetIdentitiesResponse {
+            keys: vec![PublicKey {
+                key_blob: b"ssh-ed25519-reactive".to_vec(),
+                comment: "reactive@workstation".to_string(),
+                fingerprint_sha256: "SHA256:reactivefp".to_string(),
+                key_type: "ssh-ed25519".to_string(),
+            }],
+        }))
+    }
+
+    async fn sign(&self, request: Request<SignRequest>) -> Result<Response<SignResponse>, Status> {
+        let req = request.into_inner();
+        let now_sec = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        verify_sign_request(&req, now_sec)
+            .map_err(|e| Status::permission_denied(format!("verify_sign_request failed: {e}")))?;
+
+        let cert = req
+            .relay_grant
+            .as_ref()
+            .and_then(|g| g.user_cert.as_ref())
+            .ok_or_else(|| Status::permission_denied("missing user_cert"))?;
+        let rejected = self.rejected_certs.lock().unwrap();
+        if rejected.contains(cert) {
+            return Err(Status::permission_denied("cert must be rotated"));
+        }
+        drop(rejected);
+
+        Ok(Response::new(SignResponse {
+            request_id: req.request_id,
+            approved: true,
+            signature_blob: b"reactive-sig-blob".to_vec(),
+            error_message: String::new(),
+            handled_by_node_id: "test-ws".to_string(),
+        }))
+    }
+
+    type ConnectWorkstationStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<ServerStreamMessage, Status>> + Send>>;
+
+    async fn connect_workstation(
+        &self,
+        _request: Request<Streaming<ClientStreamMessage>>,
+    ) -> Result<Response<Self::ConnectWorkstationStream>, Status> {
+        Err(Status::unimplemented("not used"))
+    }
+
+    type ConnectRelayStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<ServerToRelayMessage, Status>> + Send>>;
+
+    async fn connect_relay(
+        &self,
+        _request: Request<Streaming<RelayStreamMessage>>,
+    ) -> Result<Response<Self::ConnectRelayStream>, Status> {
+        Err(Status::unimplemented("not used"))
+    }
+}
+
+#[tokio::test]
+async fn test_reactive_renewal_on_unauthenticated_and_permission_denied_rpc() {
+    let tmp = TempDir::new().unwrap();
+    let op_sk = SigningKey::from_bytes(&[0x81; 32]);
+    let user_sk = SigningKey::from_bytes(&[0x82; 32]);
+    let relay_sk = SigningKey::from_bytes(&[0x83; 32]);
+    let user_pk = user_sk.verifying_key().to_bytes().to_vec();
+    let relay_pk = relay_sk.verifying_key().to_bytes().to_vec();
+
+    let now_sec = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // Fresh (non-expired, >50% TTL remaining) cert_v1 so proactive renewal does NOT trigger
+    let mut cert_v1 = UserCert {
+        user_id: derive_user_id(&user_pk),
+        user_pubkey: user_pk.clone(),
+        operator_pubkey: Vec::new(),
+        issued_at_unix_sec: now_sec - 10,
+        expires_at_unix_sec: now_sec + 7 * 86400,
+        operator_signature: Vec::new(),
+    };
+    sign_user_cert(&mut cert_v1, &op_sk);
+
+    let mut grant = NodeGrant {
+        user_id: String::new(),
+        user_pubkey: Vec::new(),
+        node_id: "relay-reactive.local".to_string(),
+        role: NodeRole::Relay as i32,
+        node_pubkey: relay_pk.clone(),
+        issued_at_unix_sec: now_sec - 60,
+        expires_at_unix_sec: 0,
+        user_signature: Vec::new(),
+        user_cert: Some(cert_v1.clone()),
+    };
+    sign_node_grant(&mut grant, &user_sk);
+
+    let rejected_certs = Arc::new(Mutex::new(vec![cert_v1]));
+    let mock_svc = RejectStaleCertCoordinator {
+        rejected_certs: Arc::clone(&rejected_certs),
+    };
+    let grpc_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let grpc_addr = grpc_listener.local_addr().unwrap();
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(grpc_listener);
+    tokio::spawn(async move {
+        let _ = tonic::transport::Server::builder()
+            .add_service(SshcastServiceServer::new(mock_svc))
+            .serve_with_incoming(incoming)
+            .await;
+    });
+
+    let renew_calls = Arc::new(AtomicUsize::new(0));
+    let issued_certs = Arc::new(Mutex::new(Vec::new()));
+    let op_addr = spawn_mock_renew_server(
+        op_sk,
+        user_pk,
+        relay_pk,
+        Arc::clone(&renew_calls),
+        Arc::clone(&issued_certs),
+    )
+    .await;
+
+    let cfg_path = tmp.path().join("relay.toml");
+    let bundle = EnrollmentBundle::new(vec![format!("http://{}", grpc_addr)], relay_sk, grant);
+    let mut cfg_file = RelayConfigFile::from_bundle(&bundle);
+    cfg_file.operator_url = Some(format!("http://{}", op_addr));
+    cfg_file.pubkey_cache_path = Some(tmp.path().join("pubkeys.json").to_string_lossy().to_string());
+    std::fs::write(&cfg_path, toml::to_string_pretty(&cfg_file).unwrap()).unwrap();
+
+    let cfg = RelayConfig::load(Some(&cfg_path)).unwrap();
+    let coord = Arc::new(CoordinatorClient::new(cfg));
+
+    // 1. Unauthenticated on GetIdentities triggers force renewal -> cert_v2 -> retry succeeds
+    let keys = coord.get_identities().await;
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].comment, "reactive@workstation");
+    assert_eq!(renew_calls.load(Ordering::SeqCst), 1);
+    let cert_v2 = issued_certs.lock().unwrap()[0].clone();
+    assert_eq!(coord.current_grant().await.user_cert, Some(cert_v2.clone()));
+
+    // 2. Mark cert_v2 as rejected -> PermissionDenied on Sign triggers force renewal -> cert_v3 -> retry succeeds
+    rejected_certs.lock().unwrap().push(cert_v2);
+    let sign_resp = coord
+        .sign_challenge(
+            b"ssh-ed25519-reactive".to_vec(),
+            b"challenge".to_vec(),
+            0,
+            ProcessContext {
+                hostname: "relay-reactive.local".to_string(),
+                uid: 1000,
+                pid: 99,
+                comm: "ssh".to_string(),
+                cmdline: "ssh host".to_string(),
+                cwd: "/tmp".to_string(),
+                ancestors: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(sign_resp.approved);
+    assert_eq!(sign_resp.signature_blob, b"reactive-sig-blob");
+    assert_eq!(renew_calls.load(Ordering::SeqCst), 2);
+    let cert_v3 = issued_certs.lock().unwrap()[1].clone();
+    assert_eq!(coord.current_grant().await.user_cert, Some(cert_v3.clone()));
+
+    let reloaded = RelayConfig::load(Some(&cfg_path)).unwrap();
+    assert_eq!(reloaded.grant.user_cert, Some(cert_v3));
+
+    // 3. Concurrent force renewals share renew_lock and only make 1 HTTP /api/v1/renew request
+    let (r1, r2) = tokio::join!(coord.maybe_renew_cert(true), coord.maybe_renew_cert(true));
+    assert!(r1 && r2);
+    assert_eq!(renew_calls.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn test_renew_user_cert_http_handles_operator_rejection() {
+    let user_sk = SigningKey::from_bytes(&[0x61; 32]);
+    let relay_sk = SigningKey::from_bytes(&[0x62; 32]);
+    let now_sec = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let mut grant = NodeGrant {
+        user_id: String::new(),
+        user_pubkey: Vec::new(),
+        node_id: "relay-reject.local".to_string(),
+        role: NodeRole::Relay as i32,
+        node_pubkey: relay_sk.verifying_key().to_bytes().to_vec(),
+        issued_at_unix_sec: now_sec - 60,
+        expires_at_unix_sec: 0,
+        user_signature: Vec::new(),
+        user_cert: None,
+    };
+    sign_node_grant(&mut grant, &user_sk);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            let _ = read_http_request(&mut stream).await;
+            let body = r#"{"ok":false,"error":"node revoked"}"#;
+            let resp = format!(
+                "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        }
+    });
+
+    let err = sshcast_relay::renew::renew_user_cert_http(
+        &format!("http://{}", addr),
+        &grant,
+        &relay_sk,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("node revoked"),
+        "unexpected error message: {err:#}"
+    );
 }

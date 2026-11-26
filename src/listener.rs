@@ -143,14 +143,16 @@ pub async fn serve_with_listener(
     } else {
         idle_timeout
     };
-    if cfg.zellij_enabled {
-        let zellij_cfg = cfg.clone();
+    let zellij_enabled = cfg.zellij_enabled;
+    let coord = Arc::new(CoordinatorClient::new(cfg));
+    if zellij_enabled {
+        let zellij_coord = Arc::clone(&coord);
         let zellij_shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
-            crate::zellij::run_zellij_relay_worker(zellij_cfg, zellij_shutdown).await;
+            crate::zellij::run_zellij_relay_worker_with_client(zellij_coord, zellij_shutdown)
+                .await;
         });
     }
-    let coord = Arc::new(CoordinatorClient::new(cfg));
 
     let active_conns = Arc::new(AtomicUsize::new(0));
     let last_activity = Arc::new(Mutex::new(Instant::now()));

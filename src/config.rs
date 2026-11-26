@@ -70,6 +70,9 @@ pub struct RelayConfigFile {
     /// STUN servers used for direct P2P hole-punching when a workstation connects to Zellij Web.
     #[serde(default = "default_stun_servers")]
     pub stun_servers: Vec<String>,
+    /// Optional operator API base URL for automatic `UserCert` renewal (e.g. `https://op.sshcast.net`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +89,8 @@ pub struct RelayConfig {
     pub zellij_enabled: bool,
     pub zellij_web_port: u16,
     pub stun_servers: Vec<String>,
+    pub operator_url: Option<String>,
+    pub config_path: Option<PathBuf>,
 }
 
 impl RelayConfigFile {
@@ -108,6 +113,7 @@ impl RelayConfigFile {
             zellij_enabled: false,
             zellij_web_port: default_zellij_web_port(),
             stun_servers: default_stun_servers(),
+            operator_url: None,
         }
     }
 }
@@ -120,7 +126,9 @@ impl RelayConfig {
         };
         let raw = std::fs::read_to_string(&cfg_path)
             .with_context(|| format!("failed to read relay config {}", cfg_path.display()))?;
-        Self::from_toml_str(&raw)
+        let mut cfg = Self::from_toml_str(&raw)?;
+        cfg.config_path = Some(cfg_path);
+        Ok(cfg)
     }
 
     pub fn from_toml_str(raw: &str) -> Result<Self> {
@@ -158,6 +166,10 @@ impl RelayConfig {
             _ => default_pubkey_cache_path(),
         };
 
+        let operator_url = file
+            .operator_url
+            .and_then(|s| sshcast_proto::dns::normalize_coordinator_url(&s));
+
         Ok(Self {
             servers: file.servers,
             node_signing_key,
@@ -179,6 +191,8 @@ impl RelayConfig {
             } else {
                 file.stun_servers
             },
+            operator_url,
+            config_path: None,
         })
     }
 
@@ -201,27 +215,17 @@ impl RelayConfig {
         }
         let toml_str =
             toml::to_string_pretty(&file).context("failed to serialize relay.toml")?;
-        std::fs::write(&cfg_path, &toml_str)
-            .with_context(|| format!("failed to write {}", cfg_path.display()))?;
+        write_file_atomic_0600(&cfg_path, toml_str.as_bytes())?;
         Ok(cfg_path)
     }
 
-    pub fn import_user_cert(
-        path: Option<&Path>,
-        cert_token: &str,
-    ) -> Result<(PathBuf, sshcast_proto::v1::UserCert)> {
-        let cert = sshcast_proto::bundle::decode_user_cert_token(cert_token)?;
-        let now_sec = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        sshcast_proto::crypto::verify_user_cert(&cert, &cert.user_pubkey, now_sec)?;
-
-        let cfg_path = match path {
-            Some(p) => p.to_path_buf(),
-            None => default_config_path()?,
-        };
-        let raw = std::fs::read_to_string(&cfg_path)
+    /// Updates `grant.user_cert` inside `grant_proto_b64` of `cfg_path` and atomically writes
+    /// the updated config file with `0600` permissions on Unix.
+    pub fn persist_user_cert(
+        cfg_path: &Path,
+        cert: &sshcast_proto::v1::UserCert,
+    ) -> Result<()> {
+        let raw = std::fs::read_to_string(cfg_path)
             .with_context(|| format!("failed to read relay config {}", cfg_path.display()))?;
         let mut file: RelayConfigFile =
             toml::from_str(&raw).context("failed to parse relay.toml")?;
@@ -243,10 +247,89 @@ impl RelayConfig {
         file.grant_proto_b64 = URL_SAFE_NO_PAD.encode(new_grant_bytes);
         let toml_str =
             toml::to_string_pretty(&file).context("failed to serialize relay.toml")?;
-        std::fs::write(&cfg_path, &toml_str)
-            .with_context(|| format!("failed to write {}", cfg_path.display()))?;
+        write_file_atomic_0600(cfg_path, toml_str.as_bytes())
+    }
+
+    pub fn import_user_cert(
+        path: Option<&Path>,
+        cert_token: &str,
+    ) -> Result<(PathBuf, sshcast_proto::v1::UserCert)> {
+        let cert = sshcast_proto::bundle::decode_user_cert_token(cert_token)?;
+        let now_sec = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        sshcast_proto::crypto::verify_user_cert(&cert, &cert.user_pubkey, now_sec)?;
+
+        let cfg_path = match path {
+            Some(p) => p.to_path_buf(),
+            None => default_config_path()?,
+        };
+        Self::persist_user_cert(&cfg_path, &cert)?;
         Ok((cfg_path, cert))
     }
+}
+
+fn write_file_atomic_0600(path: &Path, contents: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("relay.toml");
+
+    let mut tmp_path = None;
+    let mut tmp_file = None;
+    for _ in 0..16 {
+        let rand_val: u64 = rand::random();
+        let candidate = parent.join(format!(
+            ".{file_name}.tmp.{}.{rand_val:016x}",
+            std::process::id()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&candidate)
+        {
+            Ok(f) => {
+                tmp_path = Some(candidate);
+                tmp_file = Some(f);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("failed to create temp config file {}", candidate.display())
+                });
+            }
+        }
+    }
+
+    let (tmp_path, mut file) = match (tmp_path, tmp_file) {
+        (Some(p), Some(f)) => (p, f),
+        _ => anyhow::bail!("failed to allocate unique temp file for {}", path.display()),
+    };
+
+    let write_res = (|| -> Result<()> {
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::rename(&tmp_path, path)?;
+        Ok(())
+    })();
+
+    if let Err(e) = write_res {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e).with_context(|| format!("failed to atomically write {}", path.display()));
+    }
+    Ok(())
 }
 
 pub fn current_euid() -> u32 {

@@ -26,6 +26,7 @@ use tokio::sync::{mpsc, watch, Mutex};
 use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{ClientTlsConfig, Endpoint};
 
+use crate::client::CoordinatorClient;
 use crate::config::{home_dir, RelayConfig};
 
 /// Ensures `web_sharing "on"` is present in the given Zellij `config.kdl` file so sessions
@@ -1053,14 +1054,16 @@ async fn handle_direct_p2p_tcp_stream(
 
 async fn handle_incoming_zellij_frame(
     frame: ZellijTunnelFrame,
-    cfg: Arc<RelayConfig>,
+    coord: Arc<CoordinatorClient>,
     web_mgr: Arc<ZellijWebManager>,
     active_tunnels: Arc<Mutex<HashMap<String, mpsc::Sender<Option<Vec<u8>>>>>>,
     outbound_tx: mpsc::Sender<RelayStreamMessage>,
 ) {
+    let cfg = coord.config();
     match ZellijFrameType::try_from(frame.frame_type).unwrap_or(ZellijFrameType::Unspecified) {
         ZellijFrameType::P2pOffer => {
             tokio::spawn(async move {
+                let cfg = coord.config();
                 if let Err(e) = verify_zellij_tunnel_frame(
                     &frame,
                     NodeRole::Client,
@@ -1098,6 +1101,7 @@ async fn handle_incoming_zellij_frame(
                 let answer = P2pEndpointHandshake::new(tcp_candidates, udp_candidates);
                 let answer_bytes = answer.to_bytes();
 
+                let grant = coord.current_grant().await;
                 let mut reply_frame = ZellijTunnelFrame {
                     tunnel_id: frame.tunnel_id.clone(),
                     relay_node_id: cfg.grant.node_id.clone(),
@@ -1105,7 +1109,7 @@ async fn handle_incoming_zellij_frame(
                     frame_type: ZellijFrameType::P2pAnswer as i32,
                     payload: answer_bytes,
                     error_message: String::new(),
-                    sender_grant: Some(cfg.grant.clone()),
+                    sender_grant: Some(grant),
                     sender_signature: Vec::new(),
                 };
                 let _ = sign_zellij_tunnel_frame(&mut reply_frame, &cfg.node_signing_key);
@@ -1381,10 +1385,11 @@ async fn discover_zellij_sessions_async() -> Vec<ZellijSessionInfo> {
 
 async fn run_single_coordinator_relay_stream(
     server_url: &str,
-    cfg: Arc<RelayConfig>,
+    coord: Arc<CoordinatorClient>,
     web_mgr: Arc<ZellijWebManager>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
+    let cfg = coord.config();
     let mut endpoint = Endpoint::from_shared(server_url.to_string())
         .with_context(|| format!("invalid server URL {server_url}"))?
         .connect_timeout(Duration::from_millis(cfg.connect_timeout_ms))
@@ -1403,11 +1408,9 @@ async fn run_single_coordinator_relay_stream(
 
     let (out_tx, out_rx) = mpsc::channel::<RelayStreamMessage>(1024);
 
-    let auth = create_node_auth(
-        cfg.grant.clone(),
-        &cfg.node_signing_key,
-        now_unix_ms(),
-    )?;
+    coord.maybe_renew_cert(false).await;
+    let grant = coord.current_grant().await;
+    let auth = create_node_auth(grant, &cfg.node_signing_key, now_unix_ms())?;
     out_tx
         .send(RelayStreamMessage {
             payload: Some(RelayOutPayload::AuthHandshake(auth)),
@@ -1426,9 +1429,21 @@ async fn run_single_coordinator_relay_stream(
         })
         .await?;
 
-    let response = grpc_client
+    let response = match grpc_client
         .connect_relay(ReceiverStream::new(out_rx))
-        .await?;
+        .await
+    {
+        Ok(r) => r,
+        Err(status) => {
+            if matches!(
+                status.code(),
+                tonic::Code::Unauthenticated | tonic::Code::PermissionDenied
+            ) {
+                let _ = coord.maybe_renew_cert(true).await;
+            }
+            return Err(status.into());
+        }
+    };
     let mut inbound = response.into_inner();
     tracing::info!(
         "Connected Zellij relay stream to {} (node_id={}, sessions={})",
@@ -1465,8 +1480,18 @@ async fn run_single_coordinator_relay_stream(
                 }
             }
             msg_res = inbound.message() => {
-                let Some(msg) = msg_res? else {
-                    anyhow::bail!("coordinator closed ConnectRelay stream");
+                let msg = match msg_res {
+                    Ok(Some(m)) => m,
+                    Ok(None) => anyhow::bail!("coordinator closed ConnectRelay stream"),
+                    Err(status) => {
+                        if matches!(
+                            status.code(),
+                            tonic::Code::Unauthenticated | tonic::Code::PermissionDenied
+                        ) {
+                            let _ = coord.maybe_renew_cert(true).await;
+                        }
+                        return Err(status.into());
+                    }
                 };
                 match msg.payload {
                     Some(ServerInPayload::ServerHeartbeatEpochMs(_)) => {}
@@ -1485,7 +1510,7 @@ async fn run_single_coordinator_relay_stream(
                     Some(ServerInPayload::ZellijFrame(frame)) => {
                         handle_incoming_zellij_frame(
                             frame,
-                            Arc::clone(&cfg),
+                            Arc::clone(&coord),
                             Arc::clone(&web_mgr),
                             Arc::clone(&active_tunnels),
                             out_tx.clone(),
@@ -1501,7 +1526,7 @@ async fn run_single_coordinator_relay_stream(
 
 async fn run_coordinator_relay_stream_loop(
     server_url: String,
-    cfg: Arc<RelayConfig>,
+    coord: Arc<CoordinatorClient>,
     web_mgr: Arc<ZellijWebManager>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
@@ -1511,7 +1536,7 @@ async fn run_coordinator_relay_stream_loop(
         }
         if let Err(e) = run_single_coordinator_relay_stream(
             &server_url,
-            Arc::clone(&cfg),
+            Arc::clone(&coord),
             Arc::clone(&web_mgr),
             shutdown_rx.clone(),
         )
@@ -1539,8 +1564,18 @@ async fn run_coordinator_relay_stream_loop(
 /// dynamically discovering and updating coordinators via `_sshcast` DNS TXT records when configured.
 pub async fn run_zellij_relay_worker(
     cfg: RelayConfig,
+    shutdown_rx: watch::Receiver<bool>,
+) {
+    run_zellij_relay_worker_with_client(Arc::new(CoordinatorClient::new(cfg)), shutdown_rx).await;
+}
+
+/// Runs the persistent outbound `ConnectRelay` stream loop sharing a `CoordinatorClient`
+/// so `UserCert` auto-renewal updates are immediately reflected across both SSH and Zellij streams.
+pub async fn run_zellij_relay_worker_with_client(
+    coord: Arc<CoordinatorClient>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
+    let cfg = coord.config();
     if !cfg.zellij_enabled || cfg.servers.is_empty() {
         return;
     }
@@ -1549,26 +1584,28 @@ pub async fn run_zellij_relay_worker(
         .iter()
         .any(|s| sshcast_proto::dns::is_dns_discovery_entry(s).is_some());
     let configured_servers = cfg.servers.clone();
-    let cfg = Arc::new(cfg);
     let web_mgr = Arc::new(ZellijWebManager::new(cfg.zellij_web_port));
 
     let mut active_workers: HashMap<String, (watch::Sender<bool>, tokio::task::JoinHandle<()>)> =
         HashMap::new();
 
-    let initial_urls = {
+    let initial_discovery = {
         let s = configured_servers.clone();
-        tokio::task::spawn_blocking(move || sshcast_proto::dns::resolve_coordinator_servers(&s))
+        tokio::task::spawn_blocking(move || sshcast_proto::dns::resolve_swarm_discovery(&s))
             .await
             .unwrap_or_default()
     };
+    if let Some(op_url) = initial_discovery.operator_url {
+        coord.update_operator_url(op_url).await;
+    }
 
-    for server_url in initial_urls {
+    for server_url in initial_discovery.servers {
         let (worker_stop_tx, worker_stop_rx) = watch::channel(false);
-        let cfg_clone = Arc::clone(&cfg);
+        let coord_clone = Arc::clone(&coord);
         let web_mgr_clone = Arc::clone(&web_mgr);
         let url_clone = server_url.clone();
         let handle = tokio::spawn(async move {
-            run_coordinator_relay_stream_loop(url_clone, cfg_clone, web_mgr_clone, worker_stop_rx)
+            run_coordinator_relay_stream_loop(url_clone, coord_clone, web_mgr_clone, worker_stop_rx)
                 .await;
         });
         active_workers.insert(server_url, (worker_stop_tx, handle));
@@ -1587,11 +1624,15 @@ pub async fn run_zellij_relay_worker(
             }
             _ = dns_ticker.tick(), if has_dns_discovery => {
                 let s = configured_servers.clone();
-                let resolved = tokio::task::spawn_blocking(move || {
-                    sshcast_proto::dns::resolve_coordinator_servers(&s)
+                let discovery = tokio::task::spawn_blocking(move || {
+                    sshcast_proto::dns::resolve_swarm_discovery(&s)
                 })
                 .await
                 .unwrap_or_default();
+                if let Some(op_url) = discovery.operator_url {
+                    coord.update_operator_url(op_url).await;
+                }
+                let resolved = discovery.servers;
                 if !resolved.is_empty() {
                     let current_urls: Vec<String> = active_workers.keys().cloned().collect();
                     for old_url in current_urls {
@@ -1612,13 +1653,13 @@ pub async fn run_zellij_relay_worker(
                                 new_url
                             );
                             let (worker_stop_tx, worker_stop_rx) = watch::channel(false);
-                            let cfg_clone = Arc::clone(&cfg);
+                            let coord_clone = Arc::clone(&coord);
                             let web_mgr_clone = Arc::clone(&web_mgr);
                             let url_clone = new_url.clone();
                             let handle = tokio::spawn(async move {
                                 run_coordinator_relay_stream_loop(
                                     url_clone,
-                                    cfg_clone,
+                                    coord_clone,
                                     web_mgr_clone,
                                     worker_stop_rx,
                                 )

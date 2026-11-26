@@ -7,7 +7,8 @@ use sshcast_proto::crypto::{create_node_auth, sign_sign_request};
 use sshcast_proto::ssh::parse_ssh_auth_context;
 use sshcast_proto::v1::sshcast_service_client::SshcastServiceClient;
 use sshcast_proto::v1::{
-    GetIdentitiesRequest, ProcessContext, PublicKey, SignRequest, SignResponse,
+    GetIdentitiesRequest, GetIdentitiesResponse, NodeGrant, ProcessContext, PublicKey,
+    SshAuthContext, SignRequest, SignResponse,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -18,6 +19,7 @@ use tokio::sync::{Mutex, RwLock};
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
 use crate::config::RelayConfig;
+use crate::renew::{cert_needs_renewal, renew_user_cert_http};
 
 const DNS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -47,6 +49,9 @@ struct ResolvedServersCache {
 
 pub struct CoordinatorClient {
     cfg: RelayConfig,
+    grant: RwLock<NodeGrant>,
+    renew_lock: Mutex<()>,
+    resolved_operator_url: RwLock<Option<String>>,
     has_dns_discovery: bool,
     resolved_servers: RwLock<ResolvedServersCache>,
     channels: RwLock<HashMap<String, Channel>>,
@@ -72,9 +77,17 @@ impl CoordinatorClient {
         };
 
         let initial_keys = load_disk_pubkey_cache(&cfg.pubkey_cache_path).unwrap_or_default();
+        let initial_grant = cfg.grant.clone();
+        let initial_operator_url = cfg
+            .operator_url
+            .as_deref()
+            .and_then(sshcast_proto::dns::normalize_coordinator_url);
 
         Self {
             cfg,
+            grant: RwLock::new(initial_grant),
+            renew_lock: Mutex::new(()),
+            resolved_operator_url: RwLock::new(initial_operator_url),
             has_dns_discovery,
             resolved_servers: RwLock::new(ResolvedServersCache {
                 urls: initial_urls,
@@ -91,8 +104,24 @@ impl CoordinatorClient {
         }
     }
 
+    pub fn config(&self) -> &RelayConfig {
+        &self.cfg
+    }
+
     pub fn node_id(&self) -> &str {
         &self.cfg.grant.node_id
+    }
+
+    pub async fn current_grant(&self) -> NodeGrant {
+        self.grant.read().await.clone()
+    }
+
+    pub async fn update_operator_url(&self, op_url: String) {
+        let mut op_guard = self.resolved_operator_url.write().await;
+        if op_guard.as_ref() != Some(&op_url) {
+            tracing::info!("Resolved operator URL via _sshcast DNS TXT: {}", op_url);
+            *op_guard = Some(op_url);
+        }
     }
 
     fn now_unix_ms() -> u64 {
@@ -100,6 +129,106 @@ impl CoordinatorClient {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64
+    }
+
+    fn now_unix_sec() -> u64 {
+        Self::now_unix_ms() / 1000
+    }
+
+    async fn resolve_operator_url(&self) -> Option<String> {
+        if let Some(url) = self.resolved_operator_url.read().await.clone() {
+            return Some(url);
+        }
+        if !self.has_dns_discovery {
+            return None;
+        }
+        let configured = self.cfg.servers.clone();
+        let discovery = tokio::task::spawn_blocking(move || {
+            sshcast_proto::dns::resolve_swarm_discovery(&configured)
+        })
+        .await
+        .unwrap_or_default();
+        if let Some(op_url) = discovery.operator_url {
+            self.update_operator_url(op_url.clone()).await;
+            return Some(op_url);
+        }
+        None
+    }
+
+    /// Renews the embedded `UserCert` from the operator API if needed (or if `force` is `true`).
+    /// Returns `true` if `self.grant` now holds a freshly renewed (or concurrently renewed) `UserCert`.
+    pub async fn maybe_renew_cert(&self, force: bool) -> bool {
+        let now_sec = Self::now_unix_sec();
+        let prev_cert = {
+            let guard = self.grant.read().await;
+            if !force && !cert_needs_renewal(guard.user_cert.as_ref(), now_sec) {
+                return false;
+            }
+            guard.user_cert.clone()
+        };
+
+        let _renew_guard = self.renew_lock.lock().await;
+        let now_sec = Self::now_unix_sec();
+        let grant_snapshot = {
+            let guard = self.grant.read().await;
+            if !force && !cert_needs_renewal(guard.user_cert.as_ref(), now_sec) {
+                return false;
+            }
+            if force
+                && guard.user_cert != prev_cert
+                && guard.user_cert.is_some()
+                && !cert_needs_renewal(guard.user_cert.as_ref(), now_sec)
+            {
+                return true;
+            }
+            guard.clone()
+        };
+
+        let Some(op_url) = self.resolve_operator_url().await else {
+            tracing::debug!("Skipping UserCert renewal: no operator_url configured or discovered");
+            return false;
+        };
+
+        match renew_user_cert_http(&op_url, &grant_snapshot, &self.cfg.node_signing_key).await {
+            Ok(new_cert) => {
+                {
+                    let mut guard = self.grant.write().await;
+                    guard.user_cert = Some(new_cert.clone());
+                }
+                if let Some(cfg_path) = self.cfg.config_path.clone() {
+                    let cert_to_save = new_cert.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        RelayConfig::persist_user_cert(&cfg_path, &cert_to_save)
+                    })
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            tracing::warn!(
+                                "Renewed UserCert in memory, but failed to persist to relay.toml: {}",
+                                e
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Renewed UserCert in memory, but persistence task panicked: {}",
+                                e
+                            );
+                        }
+                    }
+                }
+                tracing::info!(
+                    "Renewed UserCert from operator {} (expires_at={})",
+                    op_url,
+                    new_cert.expires_at_unix_sec
+                );
+                true
+            }
+            Err(e) => {
+                tracing::warn!("Failed to renew UserCert from operator {}: {}", op_url, e);
+                false
+            }
+        }
     }
 
     async fn get_active_server_urls(&self) -> Vec<String> {
@@ -118,11 +247,16 @@ impl CoordinatorClient {
             }
         }
         let configured = self.cfg.servers.clone();
-        let resolved = tokio::task::spawn_blocking(move || {
-            sshcast_proto::dns::resolve_coordinator_servers(&configured)
+        let discovery = tokio::task::spawn_blocking(move || {
+            sshcast_proto::dns::resolve_swarm_discovery(&configured)
         })
         .await
         .unwrap_or_default();
+
+        if let Some(op_url) = discovery.operator_url {
+            self.update_operator_url(op_url).await;
+        }
+        let resolved = discovery.servers;
 
         let mut guard = self.resolved_servers.write().await;
         if !resolved.is_empty() {
@@ -289,7 +423,83 @@ impl CoordinatorClient {
         }
     }
 
+    async fn call_get_identities(
+        &self,
+        ch: Channel,
+    ) -> std::result::Result<tonic::Response<GetIdentitiesResponse>, tonic::Status> {
+        let grant = self.current_grant().await;
+        let auth = create_node_auth(grant, &self.cfg.node_signing_key, Self::now_unix_ms())
+            .map_err(|e| tonic::Status::internal(format!("failed to create NodeAuth: {e}")))?;
+        let mut client = SshcastServiceClient::new(ch);
+        let mut req = tonic::Request::new(GetIdentitiesRequest { auth: Some(auth) });
+        req.set_timeout(Duration::from_millis(self.cfg.connect_timeout_ms.max(3000)));
+        client.get_identities(req).await
+    }
+
+    async fn build_signed_sign_request(
+        &self,
+        request_id: String,
+        key_blob: &[u8],
+        data: &[u8],
+        flags: u32,
+        process_context: &ProcessContext,
+        ssh_auth_context: &SshAuthContext,
+    ) -> Result<SignRequest> {
+        let now_ms = Self::now_unix_ms();
+        let grant = self.current_grant().await;
+        let auth = create_node_auth(
+            grant.clone(),
+            &self.cfg.node_signing_key,
+            now_ms,
+        )?;
+        let mut sign_req = SignRequest {
+            request_id,
+            timestamp_unix_ms: now_ms,
+            key_blob: key_blob.to_vec(),
+            data: data.to_vec(),
+            flags,
+            process_context: Some(process_context.clone()),
+            ssh_auth_context: Some(ssh_auth_context.clone()),
+            relay_grant: Some(grant),
+            relay_signature: Vec::new(),
+            auth: Some(auth),
+        };
+        sign_sign_request(&mut sign_req, &self.cfg.node_signing_key)
+            .context("failed to sign SignRequest with relay Ed25519 key")?;
+        Ok(sign_req)
+    }
+
+    async fn call_sign(
+        &self,
+        ch: Channel,
+        sign_req: &SignRequest,
+        url: &str,
+    ) -> std::result::Result<SignResponse, tonic::Status> {
+        let mut client = SshcastServiceClient::new(ch);
+        let mut rpc_req = tonic::Request::new(sign_req.clone());
+        rpc_req.set_timeout(Duration::from_secs(self.cfg.sign_timeout_secs));
+        let t_sign = Instant::now();
+        tracing::info!(
+            "Dispatching SignRequest {} to {}",
+            sign_req.request_id,
+            url
+        );
+        let resp = client.sign(rpc_req).await?;
+        let inner = resp.into_inner();
+        tracing::info!(
+            "SignRequest {} returned from {} in {}ms (approved={}, handled_by={})",
+            sign_req.request_id,
+            url,
+            t_sign.elapsed().as_millis(),
+            inner.approved,
+            inner.handled_by_node_id
+        );
+        Ok(inner)
+    }
+
     async fn fetch_identities_remote(&self) -> Result<Vec<PublicKey>> {
+        self.maybe_renew_cert(false).await;
+
         let servers = self.get_active_server_urls().await;
         if servers.is_empty() {
             anyhow::bail!("no coordinator servers resolved from configuration");
@@ -297,6 +507,7 @@ impl CoordinatorClient {
         let num_servers = servers.len();
         let start = self.preferred_idx.load(Ordering::Relaxed) % num_servers;
         let mut last_err = None;
+        let mut renewed_on_auth_err = false;
 
         for offset in 0..num_servers {
             let idx = (start + offset) % num_servers;
@@ -309,17 +520,22 @@ impl CoordinatorClient {
                 }
             };
 
-            let auth = create_node_auth(
-                self.cfg.grant.clone(),
-                &self.cfg.node_signing_key,
-                Self::now_unix_ms(),
-            )?;
+            let mut res = self.call_get_identities(ch.clone()).await;
+            if let Err(ref status) = res {
+                if !renewed_on_auth_err
+                    && matches!(
+                        status.code(),
+                        tonic::Code::Unauthenticated | tonic::Code::PermissionDenied
+                    )
+                {
+                    renewed_on_auth_err = true;
+                    if self.maybe_renew_cert(true).await {
+                        res = self.call_get_identities(ch).await;
+                    }
+                }
+            }
 
-            let mut client = SshcastServiceClient::new(ch);
-            let mut req = tonic::Request::new(GetIdentitiesRequest { auth: Some(auth) });
-            req.set_timeout(Duration::from_millis(self.cfg.connect_timeout_ms.max(3000)));
-
-            match client.get_identities(req).await {
+            match res {
                 Ok(resp) => {
                     self.preferred_idx.store(idx, Ordering::Relaxed);
                     let keys = resp.into_inner().keys;
@@ -352,31 +568,20 @@ impl CoordinatorClient {
         flags: u32,
         process_context: ProcessContext,
     ) -> Result<SignResponse> {
-        let now_ms = Self::now_unix_ms();
+        self.maybe_renew_cert(false).await;
+
         let request_id = generate_request_id();
         let ssh_auth_context = parse_ssh_auth_context(&data);
-
-        let auth = create_node_auth(
-            self.cfg.grant.clone(),
-            &self.cfg.node_signing_key,
-            now_ms,
-        )?;
-
-        let mut sign_req = SignRequest {
-            request_id,
-            timestamp_unix_ms: now_ms,
-            key_blob,
-            data,
-            flags,
-            process_context: Some(process_context),
-            ssh_auth_context: Some(ssh_auth_context),
-            relay_grant: Some(self.cfg.grant.clone()),
-            relay_signature: Vec::new(),
-            auth: Some(auth),
-        };
-
-        sign_sign_request(&mut sign_req, &self.cfg.node_signing_key)
-            .context("failed to sign SignRequest with relay Ed25519 key")?;
+        let mut sign_req = self
+            .build_signed_sign_request(
+                request_id.clone(),
+                &key_blob,
+                &data,
+                flags,
+                &process_context,
+                &ssh_auth_context,
+            )
+            .await?;
 
         let servers = self.get_active_server_urls().await;
         if servers.is_empty() {
@@ -385,6 +590,7 @@ impl CoordinatorClient {
         let num_servers = servers.len();
         let start = self.preferred_idx.load(Ordering::Relaxed) % num_servers;
         let mut last_err = None;
+        let mut renewed_on_auth_err = false;
 
         for offset in 0..num_servers {
             let idx = (start + offset) % num_servers;
@@ -397,27 +603,33 @@ impl CoordinatorClient {
                 }
             };
 
-            let mut client = SshcastServiceClient::new(ch);
-            let mut rpc_req = tonic::Request::new(sign_req.clone());
-            rpc_req.set_timeout(Duration::from_secs(self.cfg.sign_timeout_secs));
+            let mut res = self.call_sign(ch.clone(), &sign_req, url).await;
+            if let Err(ref status) = res {
+                if !renewed_on_auth_err
+                    && matches!(
+                        status.code(),
+                        tonic::Code::Unauthenticated | tonic::Code::PermissionDenied
+                    )
+                {
+                    renewed_on_auth_err = true;
+                    if self.maybe_renew_cert(true).await {
+                        sign_req = self
+                            .build_signed_sign_request(
+                                request_id.clone(),
+                                &key_blob,
+                                &data,
+                                flags,
+                                &process_context,
+                                &ssh_auth_context,
+                            )
+                            .await?;
+                        res = self.call_sign(ch, &sign_req, url).await;
+                    }
+                }
+            }
 
-            let t_sign = Instant::now();
-            tracing::info!(
-                "Dispatching SignRequest {} to {}",
-                sign_req.request_id,
-                url
-            );
-            match client.sign(rpc_req).await {
-                Ok(resp) => {
-                    let inner = resp.into_inner();
-                    tracing::info!(
-                        "SignRequest {} returned from {} in {}ms (approved={}, handled_by={})",
-                        sign_req.request_id,
-                        url,
-                        t_sign.elapsed().as_millis(),
-                        inner.approved,
-                        inner.handled_by_node_id
-                    );
+            match res {
+                Ok(inner) => {
                     if inner.approved {
                         self.preferred_idx.store(idx, Ordering::Relaxed);
                         return Ok(inner);
