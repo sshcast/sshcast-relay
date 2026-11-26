@@ -11,6 +11,7 @@ Source0:        %{name}-%{version}.tar.gz
 
 BuildRequires:  cargo
 BuildRequires:  rust
+BuildRequires:  gcc
 BuildRequires:  systemd-rpm-macros
 Requires:       systemd
 

@@ -10,6 +10,9 @@ REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/..)
 
 srpm:
 	@set -euo pipefail; \
+	if ! command -v cargo >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1 || ! command -v rpmbuild >/dev/null 2>&1; then \
+		dnf -y install cargo git-core rpm-build; \
+	fi; \
 	SPEC="$(SPEC_ABS)"; \
 	OUTDIR="$(OUTDIR_ABS)"; \
 	ROOT="$(REPO_ROOT)"; \
