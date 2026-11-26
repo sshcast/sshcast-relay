@@ -11,7 +11,7 @@ use crate::config::{default_config_path, home_dir, RelayConfigFile};
 
 pub const SYSTEMD_SOCKET_UNIT: &str = r#"[Unit]
 Description=Sshcast Roaming SSH Agent Relay Socket
-Documentation=https://github.com/theraphim/sshcast-relay
+Documentation=https://github.com/sshcast/sshcast-relay
 
 [Socket]
 ListenStream=%t/sshcast.sock
@@ -27,7 +27,7 @@ pub fn render_systemd_service_unit(binary_path: &str) -> String {
     format!(
         r#"[Unit]
 Description=Sshcast Roaming SSH Agent Relay Daemon
-Documentation=https://github.com/theraphim/sshcast-relay
+Documentation=https://github.com/sshcast/sshcast-relay
 Requires=sshcast-relay.socket
 After=sshcast-relay.socket network-online.target
 
@@ -49,7 +49,7 @@ pub fn render_systemd_zellij_web_service_unit(port: u16) -> String {
     format!(
         r#"[Unit]
 Description=Sshcast Zellij Web Local Server
-Documentation=https://github.com/theraphim/sshcast-relay
+Documentation=https://github.com/sshcast/sshcast-relay
 After=network.target
 
 [Service]

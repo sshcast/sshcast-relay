@@ -6,7 +6,7 @@ Version:        0.1.0
 Release:        1%{?dist}
 Summary:        Target Host Relay Daemon for Sshcast Roaming SSH Agent
 License:        MIT OR Apache-2.0
-URL:            https://github.com/theraphim/sshcast-relay
+URL:            https://github.com/sshcast/sshcast-relay
 Source0:        %{name}-%{version}.tar.gz
 
 BuildRequires:  cargo
@@ -53,6 +53,7 @@ fi
 %systemd_user_postun_with_restart sshcast-relay.service
 
 %files
+%license LICENSE-MIT LICENSE-APACHE
 %doc doc/roaming_ssh_agent_architecture_spec.md
 %{_bindir}/sshcast-relay
 %{_userunitdir}/sshcast-relay.socket

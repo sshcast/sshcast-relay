@@ -25,3 +25,16 @@ cargo test --offline
 # Build Fedora RPM via tito
 tito build --test --rpm
 ```
+
+## Security
+
+See [SECURITY.md](SECURITY.md) for vulnerability reporting (`security@sshcast.net` / [GitHub Security Advisories](https://github.com/sshcast/sshcast-relay/security/advisories/new)), the relay cryptographic model, and release provenance verification.
+
+## License
+
+Dual-licensed under either of:
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT License ([LICENSE-MIT](LICENSE-MIT))
+
+at your option. Source repository: [https://github.com/sshcast/sshcast-relay](https://github.com/sshcast/sshcast-relay).

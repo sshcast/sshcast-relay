@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Roaming SSH Agent Target Host Relay (systemd socket-activated Linux user session daemon)"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/theraphim/sshcast-relay"
+repository = "https://github.com/sshcast/sshcast-relay"
 
 [dependencies]
 anyhow = "1"

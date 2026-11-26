@@ -1,6 +1,6 @@
 [Unit]
 Description=Sshcast Roaming SSH Agent Relay Daemon
-Documentation=https://github.com/theraphim/sshcast-relay
+Documentation=https://github.com/sshcast/sshcast-relay
 Requires=sshcast-relay.socket
 After=sshcast-relay.socket network-online.target
 

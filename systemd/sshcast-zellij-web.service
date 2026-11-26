@@ -1,6 +1,6 @@
 [Unit]
 Description=Sshcast Zellij Web Local Server
-Documentation=https://github.com/theraphim/sshcast-relay
+Documentation=https://github.com/sshcast/sshcast-relay
 After=network.target
 
 [Service]
