@@ -1,0 +1,3 @@
+[submodule "sshcast-proto"]
+	path = sshcast-proto
+	url = https://github.com/sshcast/sshcast-proto.git
