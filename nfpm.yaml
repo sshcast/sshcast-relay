@@ -1,0 +1,71 @@
+name: "sshcast-relay"
+arch: "${NFPM_ARCH}"
+platform: "linux"
+version: "${NFPM_VERSION}"
+release: "1"
+section: "net"
+priority: "optional"
+maintainer: "Paul Komkoff <i@stingr.net>"
+description: |
+  Target Host Relay Daemon for Sshcast Roaming SSH Agent
+  Sshcast Target Host Relay (sshcast-relay) is a systemd --user socket-activated
+  daemon listening on /run/user/$UID/sshcast.sock. It inspects deep caller
+  process ancestry (/proc/<pid>), parses RFC 4252 SSH authentication requests,
+  cryptographically signs SignRequests with its node Ed25519 key, and forwards
+  them over gRPC to sshcast-server.
+homepage: "https://github.com/sshcast/sshcast-relay"
+license: "MIT OR Apache-2.0"
+
+depends:
+  - systemd
+
+contents:
+  - src: target/release/sshcast-relay
+    dst: /usr/bin/sshcast-relay
+    file_info:
+      mode: 0755
+
+  - src: systemd/sshcast-relay.socket
+    dst: /usr/lib/systemd/user/sshcast-relay.socket
+    file_info:
+      mode: 0644
+
+  - src: systemd/sshcast-relay.service
+    dst: /usr/lib/systemd/user/sshcast-relay.service
+    file_info:
+      mode: 0644
+
+  - src: systemd/sshcast-zellij-web.service
+    dst: /usr/lib/systemd/user/sshcast-zellij-web.service
+    file_info:
+      mode: 0644
+
+  - src: systemd/sshcast-relay.sh
+    dst: /etc/profile.d/sshcast-relay.sh
+    type: "config|noreplace"
+    file_info:
+      mode: 0644
+
+  - src: systemd/sshcast-relay.fish
+    dst: /etc/fish/conf.d/sshcast-relay.fish
+    type: "config|noreplace"
+    file_info:
+      mode: 0644
+
+  - src: LICENSE-MIT
+    dst: /usr/share/licenses/sshcast-relay/LICENSE-MIT
+    type: license
+    file_info:
+      mode: 0644
+
+  - src: LICENSE-APACHE
+    dst: /usr/share/licenses/sshcast-relay/LICENSE-APACHE
+    type: license
+    file_info:
+      mode: 0644
+
+  - src: doc/roaming_ssh_agent_architecture_spec.md
+    dst: /usr/share/doc/sshcast-relay/roaming_ssh_agent_architecture_spec.md
+    type: doc
+    file_info:
+      mode: 0644

@@ -26,11 +26,19 @@ them over gRPC to sshcast-server.
 
 %build
 export CARGO_BUILD_JOBS="${RPM_BUILD_NCPUS:-$(nproc)}"
-cargo build %{?_smp_mflags} --release --locked --bins
+if [ -d vendor ]; then
+    cargo build %{?_smp_mflags} --release --offline --locked --bins
+else
+    cargo build %{?_smp_mflags} --release --locked --bins
+fi
 
 %check
 export CARGO_BUILD_JOBS="${RPM_BUILD_NCPUS:-$(nproc)}"
-cargo test %{?_smp_mflags} --release --locked
+if [ -d vendor ]; then
+    cargo test %{?_smp_mflags} --release --offline --locked
+else
+    cargo test %{?_smp_mflags} --release --locked
+fi
 
 %install
 install -D -m 0755 target/release/sshcast-relay %{buildroot}%{_bindir}/sshcast-relay
