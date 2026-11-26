@@ -542,12 +542,26 @@ async fn test_bind_standalone_socket_protects_active_and_non_socket_files() {
     assert!(UnixStream::connect(&active_sock).await.is_ok());
     drop(original_listener);
 
-    // 2. Stale Unix socket (no listener) should be cleaned up and rebound
+    // 2. Stale Unix socket (no listener) should be cleaned up and rebound.
+    // A concurrent test calling Command::new() can briefly inherit _stale's FD
+    // between fork() and execve() before SOCK_CLOEXEC closes it, so wait until
+    // the kernel actually reports ConnectionRefused on connect().
     let stale_sock = tmp.path().join("stale.sock");
     {
         let _stale = std::os::unix::net::UnixListener::bind(&stale_sock).unwrap();
     }
     assert!(stale_sock.exists());
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
+    loop {
+        match std::os::unix::net::UnixStream::connect(&stale_sock) {
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => break,
+            Ok(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+            }
+            Ok(_) => panic!("stale socket remained connectable beyond deadline"),
+            Err(e) => panic!("unexpected connect error while probing stale socket: {e:#}"),
+        }
+    }
     let rebound = bind_standalone_socket(&stale_sock).expect("stale socket should be rebound");
     assert!(UnixStream::connect(&stale_sock).await.is_ok());
     drop(rebound);
