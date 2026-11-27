@@ -2,7 +2,7 @@
 %global rustflags_codegen_units 16
 
 Name:           sshcast-relay
-Version:        0.1.0
+Version:        0.1.1
 Release:        1%{?dist}
 Summary:        Target Host Relay Daemon for Sshcast Roaming SSH Agent
 License:        MIT OR Apache-2.0
@@ -72,5 +72,8 @@ fi
 %config(noreplace) %{_sysconfdir}/fish/conf.d/sshcast-relay.fish
 
 %changelog
+* Fri Nov 27 2026 Paul Komkoff <i@stingr.net> - 0.1.1-1
+- Prompt before overwriting existing relay.toml on init (--force to skip) and restart running sshcast-relay.service
+
 * Sun Nov 08 2026 Paul Komkoff <i@stingr.net> - 0.1.0-1
 - Initial Fedora RPM package for sshcast-relay
