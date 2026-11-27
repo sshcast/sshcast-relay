@@ -14,7 +14,7 @@ Ultra-low-footprint Linux Target Host Relay daemon for the **Sshcast** Roaming S
   ```bash
   sshcast-relay init --bundle sc1_...
   ```
-  Writes `~/.config/sshcast/relay.toml` (`0600`), installs `~/.config/systemd/user/sshcast-relay.{socket,service}` if global RPM units are absent, and enables `sshcast-relay.socket`.
+  Writes `~/.config/sshcast/relay.toml` (`0600`), prompts before overwriting an existing config (`--force` to skip), installs `~/.config/systemd/user/sshcast-relay.{socket,service}` if global RPM units are absent, enables `sshcast-relay.socket`, and restarts `sshcast-relay.service` if already running.
 
 ## Building & Fedora RPM Packaging (`tito`)
 

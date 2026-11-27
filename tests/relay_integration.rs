@@ -20,7 +20,10 @@ use sshcast_relay::agent::{
 };
 use sshcast_relay::client::CoordinatorClient;
 use sshcast_relay::config::{RelayConfig, RelayConfigFile};
-use sshcast_relay::init::{run_init, InitOptions};
+use sshcast_relay::init::{
+    prompt_overwrite_confirmation_io, run_init, run_init_with_confirm, ExistingConfigInfo,
+    InitOptions, ServiceAction,
+};
 use sshcast_relay::listener::{bind_standalone_socket, serve_with_listener};
 use sshcast_relay::proc_inspector::{
     format_cmdline, inspect_process_context_in_proc, parse_proc_stat,
@@ -155,6 +158,7 @@ fn test_init_bundle_writes_config_and_conditional_systemd_units() {
         global_systemd_user_dir: fake_global_empty,
         skip_systemctl: true,
         enable_zellij: false,
+        ..Default::default()
     })
     .unwrap();
 
@@ -201,6 +205,7 @@ fn test_init_bundle_writes_config_and_conditional_systemd_units() {
         global_systemd_user_dir: fake_global_rpm,
         skip_systemctl: true,
         enable_zellij: true,
+        ..Default::default()
     })
     .unwrap();
 
@@ -1216,5 +1221,502 @@ async fn test_renew_user_cert_http_handles_operator_rejection() {
     assert!(
         err.to_string().contains("node revoked"),
         "unexpected error message: {err:#}"
+    );
+}
+
+fn make_test_relay_bundle_token(
+    user_seed: u8,
+    relay_seed: u8,
+    node_id: &str,
+    servers: Vec<&str>,
+) -> String {
+    let user_sk = SigningKey::from_bytes(&[user_seed; 32]);
+    let relay_sk = SigningKey::from_bytes(&[relay_seed; 32]);
+    let now_sec = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut grant = NodeGrant {
+        user_id: String::new(),
+        user_pubkey: Vec::new(),
+        node_id: node_id.to_string(),
+        role: NodeRole::Relay as i32,
+        node_pubkey: relay_sk.verifying_key().to_bytes().to_vec(),
+        issued_at_unix_sec: now_sec - 60,
+        expires_at_unix_sec: 0,
+        user_signature: Vec::new(),
+        user_cert: None,
+    };
+    sign_node_grant(&mut grant, &user_sk);
+    let bundle = EnrollmentBundle::new(
+        servers.into_iter().map(str::to_string).collect(),
+        relay_sk,
+        grant,
+    );
+    bundle.encode().unwrap()
+}
+
+#[test]
+fn test_init_existing_config_confirmation_and_force() {
+    let tmp = TempDir::new().unwrap();
+    let cfg_dir = tmp.path().join("cfg");
+    let cfg_path = cfg_dir.join("relay.toml");
+    let systemd_dir = tmp.path().join("systemd-user");
+    let fake_global = tmp.path().join("global-empty");
+
+    let token_old = make_test_relay_bundle_token(
+        0x11,
+        0x22,
+        "node-old.local",
+        vec!["https://coord-old.example.com"],
+    );
+    let token_new = make_test_relay_bundle_token(
+        0x33,
+        0x44,
+        "node-new.local",
+        vec!["https://coord-new.example.com"],
+    );
+    let expected_old_uid = derive_user_id(&SigningKey::from_bytes(&[0x11; 32]).verifying_key().to_bytes());
+    let expected_new_uid = derive_user_id(&SigningKey::from_bytes(&[0x33; 32]).verifying_key().to_bytes());
+
+    // 1. Fresh init succeeds with overwrote_existing=false and ServiceAction::Skipped
+    let out1 = run_init(&InitOptions {
+        bundle_token: token_old.clone(),
+        config_path: Some(cfg_path.clone()),
+        systemd_user_dir: Some(systemd_dir.clone()),
+        global_systemd_user_dir: fake_global.clone(),
+        skip_systemctl: true,
+        enable_zellij: false,
+        force: false,
+    })
+    .unwrap();
+    assert!(!out1.overwrote_existing);
+    assert_eq!(out1.service_action, ServiceAction::Skipped);
+    assert_eq!(
+        std::fs::metadata(&cfg_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert!(
+        !std::fs::read_dir(&cfg_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains(".tmp.")),
+        "no leftover temp files after init"
+    );
+
+    // Enable zellij and configure an explicit disk pubkey cache file in the existing config
+    RelayConfig::set_zellij_config(Some(&cfg_path), true, None).unwrap();
+    let stale_cache_path = tmp.path().join("custom-pubkeys.json");
+    std::fs::write(&stale_cache_path, b"{\"keys\":[]}").unwrap();
+    let mut old_raw = std::fs::read_to_string(&cfg_path).unwrap();
+    old_raw.push_str(&format!(
+        "pubkey_cache_path = \"{}\"\n",
+        stale_cache_path.display()
+    ));
+    std::fs::write(&cfg_path, old_raw).unwrap();
+
+    // 2. Non-interactive run_init refuses to overwrite without force=true
+    let err = run_init(&InitOptions {
+        bundle_token: token_new.clone(),
+        config_path: Some(cfg_path.clone()),
+        systemd_user_dir: Some(systemd_dir.clone()),
+        global_systemd_user_dir: fake_global.clone(),
+        skip_systemctl: true,
+        enable_zellij: false,
+        force: false,
+    })
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("--force"),
+        "expected --force hint in error, got: {err:#}"
+    );
+    assert_eq!(
+        RelayConfig::load(Some(&cfg_path)).unwrap().grant.node_id,
+        "node-old.local"
+    );
+    assert!(stale_cache_path.exists());
+
+    // 3. Invalid bundle fails before invoking confirmation callback
+    let mut callback_invoked = false;
+    let invalid_err = run_init_with_confirm(
+        &InitOptions {
+            bundle_token: "sc1_not_valid_base64".to_string(),
+            config_path: Some(cfg_path.clone()),
+            systemd_user_dir: Some(systemd_dir.clone()),
+            global_systemd_user_dir: fake_global.clone(),
+            skip_systemctl: true,
+            enable_zellij: false,
+            force: false,
+        },
+        |_| {
+            callback_invoked = true;
+            Ok(true)
+        },
+    )
+    .unwrap_err();
+    assert!(!callback_invoked, "invalid bundle must fail before prompting");
+    assert!(invalid_err.to_string().contains("bundle"));
+
+    // 4. Declining confirmation aborts and leaves existing config and cache untouched
+    let mut captured_info: Option<ExistingConfigInfo> = None;
+    let abort_err = run_init_with_confirm(
+        &InitOptions {
+            bundle_token: token_new.clone(),
+            config_path: Some(cfg_path.clone()),
+            systemd_user_dir: Some(systemd_dir.clone()),
+            global_systemd_user_dir: fake_global.clone(),
+            skip_systemctl: true,
+            enable_zellij: false,
+            force: false,
+        },
+        |info| {
+            captured_info = Some(info.clone());
+            Ok(false)
+        },
+    )
+    .unwrap_err();
+    assert!(
+        abort_err.to_string().contains("aborted"),
+        "expected aborted error, got: {abort_err:#}"
+    );
+    let info = captured_info.expect("confirmation callback must receive ExistingConfigInfo");
+    assert_eq!(info.config_path, cfg_path);
+    assert_eq!(info.current_node_id.as_deref(), Some("node-old.local"));
+    assert_eq!(info.current_user_id.as_deref(), Some(expected_old_uid.as_str()));
+    assert_eq!(info.current_servers, vec!["https://coord-old.example.com"]);
+    assert_eq!(info.current_zellij_enabled, Some(true));
+    assert_eq!(info.new_node_id, "node-new.local");
+    assert_eq!(info.new_user_id, expected_new_uid);
+    assert_eq!(info.new_servers, vec!["https://coord-new.example.com"]);
+    assert!(!info.new_enable_zellij);
+    assert_eq!(
+        RelayConfig::load(Some(&cfg_path)).unwrap().grant.node_id,
+        "node-old.local"
+    );
+    assert!(stale_cache_path.exists());
+
+    // 5. Confirming overwrite updates config atomically and clears old pubkey_cache_path
+    let out_confirm = run_init_with_confirm(
+        &InitOptions {
+            bundle_token: token_new.clone(),
+            config_path: Some(cfg_path.clone()),
+            systemd_user_dir: Some(systemd_dir.clone()),
+            global_systemd_user_dir: fake_global.clone(),
+            skip_systemctl: true,
+            enable_zellij: false,
+            force: false,
+        },
+        |_| Ok(true),
+    )
+    .unwrap();
+    assert!(out_confirm.overwrote_existing);
+    assert_eq!(
+        std::fs::metadata(&cfg_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert!(
+        !std::fs::read_dir(&cfg_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains(".tmp.")),
+        "no leftover temp files after overwrite"
+    );
+    let reloaded = RelayConfig::load(Some(&cfg_path)).unwrap();
+    assert_eq!(reloaded.grant.node_id, "node-new.local");
+    assert_eq!(
+        reloaded.node_signing_key.to_bytes(),
+        SigningKey::from_bytes(&[0x44; 32]).to_bytes()
+    );
+    assert!(!reloaded.zellij_enabled);
+    assert!(
+        !stale_cache_path.exists(),
+        "stale disk pubkey cache from old config should be deleted on overwrite"
+    );
+
+    // 6. force=true overwrites without prompting
+    let out_force = run_init(&InitOptions {
+        bundle_token: token_old,
+        config_path: Some(cfg_path.clone()),
+        systemd_user_dir: Some(systemd_dir.clone()),
+        global_systemd_user_dir: fake_global.clone(),
+        skip_systemctl: true,
+        enable_zellij: false,
+        force: true,
+    })
+    .unwrap();
+    assert!(out_force.overwrote_existing);
+    assert_eq!(
+        RelayConfig::load(Some(&cfg_path)).unwrap().grant.node_id,
+        "node-old.local"
+    );
+
+    // 7. Corrupt/unparseable existing config still triggers confirmation and recovers on Ok(true)
+    std::fs::write(&cfg_path, b"not valid toml = = =").unwrap();
+    let mut corrupt_info: Option<ExistingConfigInfo> = None;
+    let corrupt_abort = run_init_with_confirm(
+        &InitOptions {
+            bundle_token: token_new.clone(),
+            config_path: Some(cfg_path.clone()),
+            systemd_user_dir: Some(systemd_dir.clone()),
+            global_systemd_user_dir: fake_global.clone(),
+            skip_systemctl: true,
+            enable_zellij: false,
+            force: false,
+        },
+        |info| {
+            corrupt_info = Some(info.clone());
+            Ok(false)
+        },
+    )
+    .unwrap_err();
+    assert!(corrupt_abort.to_string().contains("aborted"));
+    let cinfo = corrupt_info.unwrap();
+    assert!(cinfo.current_node_id.is_none());
+    assert!(cinfo.current_user_id.is_none());
+    assert!(cinfo.current_zellij_enabled.is_none());
+    assert_eq!(std::fs::read(&cfg_path).unwrap(), b"not valid toml = = =");
+
+    let out_recover = run_init_with_confirm(
+        &InitOptions {
+            bundle_token: token_new,
+            config_path: Some(cfg_path.clone()),
+            systemd_user_dir: Some(systemd_dir),
+            global_systemd_user_dir: fake_global,
+            skip_systemctl: true,
+            enable_zellij: false,
+            force: false,
+        },
+        |_| Ok(true),
+    )
+    .unwrap();
+    assert!(out_recover.overwrote_existing);
+    assert_eq!(
+        RelayConfig::load(Some(&cfg_path)).unwrap().grant.node_id,
+        "node-new.local"
+    );
+}
+
+#[test]
+fn test_prompt_overwrite_confirmation_io() {
+    let info = ExistingConfigInfo {
+        config_path: std::path::PathBuf::from("/tmp/relay.toml"),
+        current_node_id: Some("old-node".to_string()),
+        current_user_id: Some("sc_u_old".to_string()),
+        current_servers: vec!["https://c1.example.com".to_string()],
+        current_zellij_enabled: Some(true),
+        new_node_id: "new-node".to_string(),
+        new_user_id: "sc_u_new".to_string(),
+        new_servers: vec!["https://c2.example.com".to_string()],
+        new_enable_zellij: false,
+    };
+
+    // Non-TTY fails fast without reading input
+    let mut non_tty_reader = std::io::Cursor::new(b"y\n".as_slice());
+    let mut non_tty_out = Vec::new();
+    let err = prompt_overwrite_confirmation_io(&info, false, &mut non_tty_reader, &mut non_tty_out)
+        .unwrap_err();
+    assert!(err.to_string().contains("--force"));
+    assert!(non_tty_out.is_empty());
+
+    // TTY with "y" and "YES" returns true and renders summary + Zellij warning
+    for yes_input in [b"y\n".as_slice(), b"YES\n".as_slice()] {
+        let mut reader = std::io::Cursor::new(yes_input);
+        let mut out = Vec::new();
+        assert!(prompt_overwrite_confirmation_io(&info, true, &mut reader, &mut out).unwrap());
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("old-node"));
+        assert!(text.contains("sc_u_old"));
+        assert!(text.contains("new-node"));
+        assert!(text.contains("sc_u_new"));
+        assert!(text.contains("Zellij Web"));
+        assert!(text.contains("[y/N]"));
+    }
+
+    // TTY defaults to false on empty line, "n", "no", or EOF
+    for no_input in [
+        b"\n".as_slice(),
+        b"n\n".as_slice(),
+        b"no\n".as_slice(),
+        b"".as_slice(),
+    ] {
+        let mut reader = std::io::Cursor::new(no_input);
+        let mut out = Vec::new();
+        assert!(!prompt_overwrite_confirmation_io(&info, true, &mut reader, &mut out).unwrap());
+    }
+
+    // Unparseable existing config renders fallback prompt
+    let unparseable = ExistingConfigInfo {
+        config_path: std::path::PathBuf::from("/tmp/relay.toml"),
+        current_node_id: None,
+        current_user_id: None,
+        current_servers: Vec::new(),
+        current_zellij_enabled: None,
+        new_node_id: "new-node".to_string(),
+        new_user_id: "sc_u_new".to_string(),
+        new_servers: vec!["https://c2.example.com".to_string()],
+        new_enable_zellij: false,
+    };
+    let mut reader = std::io::Cursor::new(b"y\n".as_slice());
+    let mut out = Vec::new();
+    assert!(prompt_overwrite_confirmation_io(&unparseable, true, &mut reader, &mut out).unwrap());
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("could not parse as relay config"));
+    assert!(text.contains("[y/N]"));
+}
+
+#[test]
+fn test_cli_init_restarts_running_service_and_requires_force_non_tty() {
+    let tmp = TempDir::new().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    let home_dir = tmp.path().join("home");
+    let xdg_cfg = tmp.path().join("xdg_config");
+    let xdg_cache = tmp.path().join("xdg_cache");
+    let log_path = tmp.path().join("systemctl.log");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::create_dir_all(&home_dir).unwrap();
+    std::fs::create_dir_all(&xdg_cfg).unwrap();
+    std::fs::create_dir_all(&xdg_cache).unwrap();
+
+    let fake_systemctl = bin_dir.join("systemctl");
+    let script = r#"#!/bin/sh
+echo "$*" >> "$FAKE_SYSTEMCTL_LOG"
+if [ "$1" = "--user" ] && [ "$2" = "is-active" ]; then
+  [ "${FAKE_SERVICE_ACTIVE:-0}" = "1" ] && exit 0 || exit 3
+fi
+if [ "$1" = "--user" ] && [ "$2" = "try-restart" ]; then
+  [ "${FAKE_TRY_RESTART_FAIL:-0}" = "1" ] && exit 1 || exit 0
+fi
+exit 0
+"#;
+    std::fs::write(&fake_systemctl, script).unwrap();
+    std::fs::set_permissions(&fake_systemctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let token1 =
+        make_test_relay_bundle_token(0x11, 0x22, "node-1.local", vec!["https://c1.example.com"]);
+    let token2 =
+        make_test_relay_bundle_token(0x33, 0x44, "node-2.local", vec!["https://c2.example.com"]);
+
+    let path_env = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let run_cli = |args: &[&str], active: &str, try_restart_fail: &str| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_sshcast-relay"))
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .env("HOME", &home_dir)
+            .env("XDG_CONFIG_HOME", &xdg_cfg)
+            .env("XDG_CACHE_HOME", &xdg_cache)
+            .env("PATH", &path_env)
+            .env("FAKE_SYSTEMCTL_LOG", &log_path)
+            .env("FAKE_SERVICE_ACTIVE", active)
+            .env("FAKE_TRY_RESTART_FAIL", try_restart_fail)
+            .output()
+            .unwrap()
+    };
+
+    let cfg_path = xdg_cfg.join("sshcast").join("relay.toml");
+
+    // 1. Fresh init with inactive service: enables socket + calls try-restart (not restart/start)
+    let out1 = run_cli(&["init", "--bundle", &token1], "0", "0");
+    assert!(
+        out1.status.success(),
+        "fresh init failed: stderr={}",
+        String::from_utf8_lossy(&out1.stderr)
+    );
+    let log1 = std::fs::read_to_string(&log_path).unwrap();
+    let lines1: Vec<&str> = log1.lines().collect();
+    assert!(lines1.contains(&"--user daemon-reload"));
+    assert!(lines1.contains(&"--user enable --now sshcast-relay.socket"));
+    assert!(lines1.contains(&"--user is-active --quiet sshcast-relay.service"));
+    assert!(lines1.contains(&"--user try-restart sshcast-relay.service"));
+    assert!(!lines1.contains(&"--user restart sshcast-relay.service"));
+    assert!(!lines1.contains(&"--user start sshcast-relay.service"));
+    assert_eq!(
+        RelayConfig::load(Some(&cfg_path)).unwrap().grant.node_id,
+        "node-1.local"
+    );
+
+    // 2. Non-TTY re-init without --force fails before modifying config or calling systemctl
+    std::fs::write(&log_path, "").unwrap();
+    let out2 = run_cli(&["init", "--bundle", &token2], "1", "0");
+    assert!(!out2.status.success(), "non-TTY re-init without --force must fail");
+    let stderr2 = String::from_utf8_lossy(&out2.stderr);
+    assert!(stderr2.contains("--force"), "expected --force hint: {stderr2}");
+    assert!(
+        std::fs::read_to_string(&log_path).unwrap().is_empty(),
+        "systemctl must not run when overwrite is aborted"
+    );
+    assert_eq!(
+        RelayConfig::load(Some(&cfg_path)).unwrap().grant.node_id,
+        "node-1.local"
+    );
+
+    // 3. Re-init with --force when service is active: clears stale cache, calls try-restart, prints restarted
+    let default_cache = xdg_cache.join("sshcast").join("pubkeys.json");
+    std::fs::create_dir_all(default_cache.parent().unwrap()).unwrap();
+    std::fs::write(&default_cache, b"stale").unwrap();
+    std::fs::write(&log_path, "").unwrap();
+    let out3 = run_cli(&["init", "--bundle", &token2, "--force"], "1", "0");
+    assert!(
+        out3.status.success(),
+        "re-init with --force failed: stderr={}",
+        String::from_utf8_lossy(&out3.stderr)
+    );
+    assert_eq!(
+        RelayConfig::load(Some(&cfg_path)).unwrap().grant.node_id,
+        "node-2.local"
+    );
+    assert!(
+        !default_cache.exists(),
+        "stale default pubkeys.json should be removed on re-init"
+    );
+    let log3 = std::fs::read_to_string(&log_path).unwrap();
+    assert!(log3.lines().any(|l| l == "--user try-restart sshcast-relay.service"));
+    let stdout3 = String::from_utf8_lossy(&out3.stdout);
+    assert!(
+        stdout3.contains("restarted sshcast-relay.service"),
+        "expected restarted message in stdout: {stdout3}"
+    );
+
+    // 4. Re-init with --force --enable-zellij when service is active: calls restart (not start)
+    std::fs::write(&log_path, "").unwrap();
+    let out4 = run_cli(
+        &["init", "--bundle", &token1, "--force", "--enable-zellij"],
+        "1",
+        "0",
+    );
+    assert!(
+        out4.status.success(),
+        "re-init with --enable-zellij failed: stderr={}",
+        String::from_utf8_lossy(&out4.stderr)
+    );
+    let log4 = std::fs::read_to_string(&log_path).unwrap();
+    let lines4: Vec<&str> = log4.lines().collect();
+    assert!(lines4.contains(&"--user enable --now sshcast-zellij-web.service"));
+    assert!(lines4.contains(&"--user restart sshcast-relay.service"));
+    assert!(!lines4.contains(&"--user start sshcast-relay.service"));
+    let stdout4 = String::from_utf8_lossy(&out4.stdout);
+    assert!(stdout4.contains("restarted sshcast-relay.service"));
+    let zellij_cfg = std::fs::read_to_string(xdg_cfg.join("zellij").join("config.kdl")).unwrap();
+    assert!(zellij_cfg.contains("web_sharing \"on\""));
+
+    // 5. Re-init with --force when try-restart fails: succeeds with config write and warns on stderr
+    std::fs::write(&log_path, "").unwrap();
+    let out5 = run_cli(&["init", "--bundle", &token2, "--force"], "1", "1");
+    assert!(
+        out5.status.success(),
+        "init should still exit 0 when restart fails: stderr={}",
+        String::from_utf8_lossy(&out5.stderr)
+    );
+    assert_eq!(
+        RelayConfig::load(Some(&cfg_path)).unwrap().grant.node_id,
+        "node-2.local"
+    );
+    let stderr5 = String::from_utf8_lossy(&out5.stderr);
+    assert!(
+        stderr5.contains("could not automatically restart sshcast-relay.service"),
+        "expected restart warning on stderr: {stderr5}"
     );
 }

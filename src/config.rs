@@ -270,7 +270,7 @@ impl RelayConfig {
     }
 }
 
-fn write_file_atomic_0600(path: &Path, contents: &[u8]) -> Result<()> {
+pub(crate) fn write_file_atomic_0600(path: &Path, contents: &[u8]) -> Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 

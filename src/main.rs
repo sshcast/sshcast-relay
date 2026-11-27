@@ -1,7 +1,9 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use sshcast_relay::config::RelayConfig;
-use sshcast_relay::init::{run_init, InitOptions};
+use sshcast_relay::init::{
+    prompt_overwrite_confirmation, run_init_with_confirm, InitOptions, ServiceAction,
+};
 use sshcast_relay::listener::run_daemon;
 use sshcast_relay::zellij::{discover_zellij_sessions, ensure_zellij_web_sharing_enabled};
 use std::path::PathBuf;
@@ -38,6 +40,10 @@ enum Commands {
         /// Enable Zellij Web session advertisement and tunneling (`zellij web` on 127.0.0.1)
         #[arg(long, default_value_t = false)]
         enable_zellij: bool,
+
+        /// Overwrite an existing `relay.toml` without prompting for confirmation
+        #[arg(long, default_value_t = false)]
+        force: bool,
     },
     /// Run the SSH agent relay daemon (invoked via `systemd --user` socket activation or standalone)
     Run {
@@ -112,15 +118,17 @@ async fn main() -> Result<()> {
             config,
             no_systemctl,
             enable_zellij,
+            force,
         } => {
             let opts = InitOptions {
                 bundle_token: bundle,
                 config_path: config,
                 skip_systemctl: no_systemctl,
                 enable_zellij,
+                force,
                 ..Default::default()
             };
-            let outcome = run_init(&opts)?;
+            let outcome = run_init_with_confirm(&opts, prompt_overwrite_confirmation)?;
             println!(
                 "Enrolled sshcast-relay node '{}' for user '{}'",
                 outcome.node_id, outcome.user_id
@@ -137,6 +145,25 @@ async fn main() -> Result<()> {
                 }
             } else {
                 println!("  Using global RPM systemd user units in /usr/lib/systemd/user/");
+            }
+            match outcome.service_action {
+                ServiceAction::Restarted => {
+                    println!("  Service:           restarted sshcast-relay.service");
+                }
+                ServiceAction::Started => {
+                    println!("  Service:           started sshcast-relay.service");
+                }
+                ServiceAction::RestartFailed => {
+                    eprintln!(
+                        "Warning: could not automatically restart sshcast-relay.service; if running, run `systemctl --user restart sshcast-relay.service` to apply the new configuration."
+                    );
+                }
+                ServiceAction::Skipped if outcome.overwrote_existing => {
+                    println!(
+                        "  Note:              if sshcast-relay is currently running, restart it to apply the new configuration"
+                    );
+                }
+                ServiceAction::NotRunning | ServiceAction::Skipped => {}
             }
             println!(
                 "\nEnsure your shell profile exports:\n  bash/zsh: export SSH_AUTH_SOCK=\"$XDG_RUNTIME_DIR/sshcast.sock\"\n  fish:     set -gx SSH_AUTH_SOCK \"$XDG_RUNTIME_DIR/sshcast.sock\""
